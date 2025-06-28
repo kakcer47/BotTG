@@ -1,228 +1,280 @@
+import logging
+import schedule
+import time
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    ConversationHandler,
+    ContextTypes,
+)
+from threading import Thread
+from uuid import uuid4
+
+# Logging setup for debugging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Conversation states
+CATEGORY, GENDER, LOCATION, DATE, ANNOUNCEMENT = range(5)
+
+# Environment variable for bot token (set in Render)
 import os
-import asyncio
-import threading
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, filters, CallbackContext
-from sqlalchemy import Column, Integer, String, ForeignKey, create_engine, text
-from sqlalchemy.orm import sessionmaker, declarative_base
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
 
-# Инициализация переменных окружения
-bot_token = os.getenv('BOT_TOKEN')
-group_id = int(os.getenv('GROUP_ID'))  # убедись, что это число
-database_url = os.getenv('DATABASE_URL')
-bot = Bot(token=bot_token)
+# Function to ping the bot itself to prevent Render from idling
+def ping_self():
+    try:
+        response = requests.get(RENDER_URL)
+        logger.info(f"Pinged {RENDER_URL}, status: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Ping failed: {e}")
 
-# SQLAlchemy настройка
-engine = create_engine(database_url)
-Base = declarative_base()
-Session = sessionmaker(bind=engine)
+# Schedule ping every 5 minutes
+schedule.every(5).minutes.do(ping_self)
 
-# Удаляем таблицы
-with engine.connect() as conn:
-    conn.execute(text("DROP TABLE IF EXISTS announcements CASCADE"))
-    conn.execute(text("DROP TABLE IF EXISTS users CASCADE"))
-    conn.commit()
-
-# Модели
-class User(Base):
-    __tablename__ = 'users'
-    id = Column(Integer, primary_key=True)
-    language = Column(String)
-    announcement_count = Column(Integer, default=0)
-
-class Announcement(Base):
-    __tablename__ = 'announcements'
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey('users.id'))
-    category = Column(String)
-    gender = Column(String)
-    city = Column(String)
-    date = Column(String)
-    message = Column(String)
-    message_id = Column(Integer)
-    complaint_count = Column(Integer, default=0)
-
-Base.metadata.create_all(engine)
-
-# Соответствие категорий к thread_id в супергруппе
-CATEGORY_TO_THREAD_ID = {
-    "Тема1": 101,  # Замените на реальные ID топиков
-    "Тема2": 102,
-    "Тема3": 103
-}
-
-# Keep-alive
-async def keep_alive():
+# Run scheduler in a separate thread
+def run_scheduler():
     while True:
-        await bot.get_me()
-        await asyncio.sleep(25 * 60)
+        schedule.run_pending()
+        time.sleep(60)
 
-def start_keep_alive():
-    asyncio.run(keep_alive())
+# Start scheduler in background
+Thread(target=run_scheduler, daemon=True).start()
 
-# Команда /start
-def start(update: Update, context: CallbackContext):
-    keyboard = [
-        [InlineKeyboardButton("Русский", callback_data='lang_ru')],
-        [InlineKeyboardButton("English", callback_data='lang_en')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text('Выберите язык:', reply_markup=reply_markup)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Initiate the conversation, ask for category selection."""
+    chat_id = update.effective_chat.id
+    try:
+        # Fetch chat topics (threads) from the chat
+        forum_topics = await context.bot.get_forum_topic_icon_suggestions(chat_id)
+        topics = []
+        # Simulate topic fetching (replace with actual topic retrieval logic if needed)
+        # For simplicity, assuming topics are predefined or fetched dynamically
+        topic_names = ["General", "Philosophy", "Meetups", "Discussions"]  # Example topics
+        for i, topic in enumerate(topic_names):
+            topics.append(
+                InlineKeyboardButton(topic, callback_data=f"category_{topic}_{i}")
+            )
 
-# Обработка кнопок
-def button(update: Update, context: CallbackContext):
+        topics.append(InlineKeyboardButton("Back", callback_data="back_start"))
+        keyboard = [topics[i:i+2] for i in range(0, len(topics), 2)]  # 2 buttons per row
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.reply_text(
+            "In which category would you like to create an announcement?",
+            reply_markup=reply_markup
+        )
+        return CATEGORY
+    except Exception as e:
+        logger.error(f"Error fetching topics: {e}")
+        await update.message.reply_text("Error fetching categories. Try again.")
+        return ConversationHandler.END
+
+async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle category selection, ask for gender."""
     query = update.callback_query
-    query.answer()
-    user_id = query.from_user.id
-    session = Session()
-
+    await query.answer()
     data = query.data
 
-    if data == 'lang_en':
-        query.edit_message_text('Select your language:')
-    elif data == 'lang_ru':
-        user = session.query(User).filter_by(id=user_id).first()
-        if not user:
-            user = User(id=user_id, language='ru')
-            session.add(user)
-            session.commit()
-        select_category(query)
-    elif data == 'change_lang':
-        keyboard = [
-            [InlineKeyboardButton("Русский", callback_data='lang_ru')],
-            [InlineKeyboardButton("English", callback_data='lang_en')]
-        ]
-        query.edit_message_text('Выберите язык:', reply_markup=InlineKeyboardMarkup(keyboard))
-    elif data.startswith('cat_'):
-        context.user_data['category'] = data[4:]
-        select_gender(query)
-    elif data == 'back_to_categories':
-        select_category(query)
-    elif data in ['gender_male', 'gender_female']:
-        context.user_data['gender'] = 'Мужской' if data == 'gender_male' else 'Женский'
-        context.user_data['step'] = 'city'
-        query.edit_message_text('Ваш город?')
-    elif data == 'complain':
-        handle_complaint(query)
-    elif data.startswith('delete_'):
-        delete_announcement(query, data[7:])
-    session.close()
+    if data == "back_start":
+        await query.message.delete()
+        return await start(update, context)
 
-def select_category(query):
-    keyboard = [[InlineKeyboardButton(cat, callback_data=f'cat_{cat}')] for cat in CATEGORY_TO_THREAD_ID]
-    keyboard.insert(0, [InlineKeyboardButton("Сменить язык", callback_data='change_lang')])
-    query.edit_message_text('Выберите категорию:', reply_markup=InlineKeyboardMarkup(keyboard))
+    # Store selected category
+    context.user_data["category"] = data.split("_")[1]
+    context.user_data["category_id"] = data.split("_")[2]
 
-def select_gender(query):
     keyboard = [
-        [InlineKeyboardButton("Мужской", callback_data='gender_male')],
-        [InlineKeyboardButton("Женский", callback_data='gender_female')],
-        [InlineKeyboardButton("Назад", callback_data='back_to_categories')]
+        [InlineKeyboardButton("Male", callback_data="gender_male")],
+        [InlineKeyboardButton("Female", callback_data="gender_female")],
+        [InlineKeyboardButton("Back", callback_data="back_category")]
     ]
-    query.edit_message_text('Выберите пол:', reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-# Обработка пользовательского ввода по шагам
-def process_input(update: Update, context: CallbackContext):
-    step = context.user_data.get('step')
-    text = update.message.text
-
-    if step == 'city':
-        context.user_data['city'] = text
-        context.user_data['step'] = 'date'
-        update.message.reply_text('Когда будет происходить событие?')
-    elif step == 'date':
-        context.user_data['date'] = text
-        context.user_data['step'] = 'message'
-        update.message.reply_text('Введите ваше сообщение:')
-    elif step == 'message':
-        context.user_data['message'] = text
-        context.user_data['step'] = None
-        post_announcement(update, context)
-
-# Публикация объявления
-def post_announcement(update: Update, context: CallbackContext):
-    session = Session()
-    user_id = update.message.from_user.id
-    user = session.query(User).filter_by(id=user_id).first()
-
-    if user.announcement_count >= 3:
-        announcements = session.query(Announcement).filter_by(user_id=user_id).all()
-        keyboard = [[InlineKeyboardButton(f"Удалить из {ann.category}", callback_data=f'delete_{ann.category}')] for ann in announcements]
-        update.message.reply_text('У вас уже есть 3 объявления. Удалите одно, чтобы создать новое.', reply_markup=InlineKeyboardMarkup(keyboard))
-        session.close()
-        return
-
-    category = context.user_data['category']
-    thread_id = CATEGORY_TO_THREAD_ID.get(category)
-    text_msg = f"{context.user_data['gender']}. {context.user_data['city']}. {context.user_data['date']}\n\n{context.user_data['message']}"
-    
-    sent_message = bot.send_message(chat_id=group_id, text=text_msg, message_thread_id=thread_id)
-    
-    keyboard = [
-        [InlineKeyboardButton("Пожаловаться", callback_data='complain'),
-         InlineKeyboardButton("Написать", url=f'tg://user?id={user_id}')]]
-    bot.send_message(chat_id=group_id, text="Действия:", reply_markup=InlineKeyboardMarkup(keyboard), message_thread_id=thread_id)
-
-    ann = Announcement(
-        user_id=user_id,
-        category=category,
-        gender=context.user_data['gender'],
-        city=context.user_data['city'],
-        date=context.user_data['date'],
-        message=context.user_data['message'],
-        message_id=sent_message.message_id
+    await query.message.delete()
+    await query.message.reply_text(
+        "Your gender:",
+        reply_markup=reply_markup
     )
-    session.add(ann)
-    user.announcement_count += 1
-    session.commit()
-    session.close()
-    update.message.reply_text("Объявление опубликовано!")
+    return GENDER
 
-# Жалоба
-def handle_complaint(query):
-    session = Session()
-    ann = session.query(Announcement).filter_by(message_id=query.message.message_id).first()
-    if ann:
-        ann.complaint_count += 1
-        if ann.complaint_count >= 5:
-            bot.delete_message(chat_id=group_id, message_id=ann.message_id)
-            bot.send_message(chat_id=ann.user_id, text="Ваше объявление удалено из-за жалоб.")
-            session.delete(ann)
-        session.commit()
-    session.close()
-    query.edit_message_text("Жалоба учтена.")
+async def gender_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle gender selection, ask for location."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
 
-# Удаление объявления
-def delete_announcement(query, category):
-    session = Session()
-    user_id = query.from_user.id
-    ann = session.query(Announcement).filter_by(user_id=user_id, category=category).first()
-    if ann:
-        bot.delete_message(chat_id=group_id, message_id=ann.message_id)
-        session.delete(ann)
-        user = session.query(User).filter_by(id=user_id).first()
-        user.announcement_count -= 1
-        session.commit()
-    session.close()
-    query.edit_message_text("Объявление удалено. Можете создать новое.")
+    if data == "back_category":
+        await query.message.delete()
+        return await start(update, context)
 
-# Основная функция
+    # Store selected gender
+    context.user_data["gender"] = "Male" if data == "gender_male" else "Female"
+
+    keyboard = [[InlineKeyboardButton("Back", callback_data="back_gender")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.message.delete()
+    await query.message.reply_text(
+        "Write where the meeting will take place:",
+        reply_markup=reply_markup
+    )
+    return LOCATION
+
+async def location_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle location input, ask for date."""
+    if update.message.text == "Back":
+        await update.message.delete()
+        return await category_selected(update, context)
+
+    # Store location
+    context.user_data["location"] = update.message.text
+
+    keyboard = [
+        [InlineKeyboardButton("Skip", callback_data="date_skip")],
+        [InlineKeyboardButton("Back", callback_data="back_location")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.delete()
+    await update.message.reply_text(
+        "Date of the meeting, example: 06.05-10.05 (from-to), or exact date, or skip:",
+        reply_markup=reply_markup
+    )
+    return DATE
+
+async def date_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle date input or skip, ask for announcement text."""
+    query = update.callback_query
+    if query:
+        await query.answer()
+        data = query.data
+
+        if data == "back_location":
+            await query.message.delete()
+            return await gender_selected(update, context)
+        elif data == "date_skip":
+            context.user_data["date"] = ""
+            await query.message.delete()
+            keyboard = [[InlineKeyboardButton("Back", callback_data="back_date")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.message.reply_text(
+                "Write your announcement, example: Looking for a friend for philosophical discussions on deep topics.",
+                reply_markup=reply_markup
+            )
+            return ANNOUNCEMENT
+    else:
+        # Validate date format (basic check)
+        date_text = update.message.text
+        if date_text == "Back":
+            await update.message.delete()
+            return await gender_selected(update, context)
+        # Allow any format for simplicity, or add regex for stricter validation
+        context.user_data["date"] = date_text
+
+        keyboard = [[InlineKeyboardButton("Back", callback_data="back_date")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await update.message.delete()
+        await update.message.reply_text(
+            "Write your announcement, example: Looking for a friend for philosophical discussions on deep topics.",
+            reply_markup=reply_markup
+        )
+        return ANNOUNCEMENT
+
+async def announcement_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle announcement text, post to chat, and send confirmation."""
+    if update.message.text == "Back":
+        await update.message.delete()
+        return await date_selected(update, context)
+
+    # Store announcement
+    context.user_data["announcement"] = update.message.text
+
+    # Format the announcement
+    gender = context.user_data["gender"]
+    location = context.user_data["location"]
+    date = context.user_data["date"]
+    announcement = context.user_data["announcement"]
+    category_id = context.user_data["category_id"]
+
+    # Create formatted message
+    header = f"{gender}. {location}. {date}".strip()
+    if header.endswith("."):
+        header = header[:-1]  # Remove trailing dot if date is empty
+    formatted_message = f">{header}\n{announcement}"
+
+    # Post to the selected topic in the chat
+    chat_id = update.effective_chat.id
+    try:
+        message = await context.bot.send_message(
+            chat_id=chat_id,
+            text=formatted_message,
+            message_thread_id=int(category_id) if category_id.isdigit() else None
+        )
+
+        # Generate a link to the message (Telegram doesn't provide direct links easily, so approximate)
+        message_link = f"https://t.me/c/{str(chat_id).replace('-100', '')}/{message.message_id}"
+
+        # Notify user of successful posting
+        await update.message.reply_text(
+            f"Announcement posted successfully: {message_link}"
+        )
+    except Exception as e:
+        logger.error(f"Error posting announcement: {e}")
+        await update.message.reply_text("Error posting announcement. Try again.")
+
+    # Clear user data
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the conversation."""
+    await update.message.reply_text("Operation cancelled.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors during conversation."""
+    logger.error(f"Update {update} caused error {context.error}")
+    if update.message:
+        await update.message.reply_text("An error occurred. Please try again.")
+    return ConversationHandler.END
+
 def main():
-    updater = Updater(bot_token, use_context=True)
-    dp = updater.dispatcher
+    """Run the bot."""
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    dp.add_handler(CommandHandler('start', start))
-    dp.add_handler(CallbackQueryHandler(button))
-    dp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, process_input))
+    # Conversation handler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            CATEGORY: [CallbackQueryHandler(category_selected)],
+            GENDER: [CallbackQueryHandler(gender_selected)],
+            LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, location_received)],
+            DATE: [
+                CallbackQueryHandler(date_selected),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, date_selected)
+            ],
+            ANNOUNCEMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, announcement_received)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
 
-    # Запуск webhook
-    updater.start_webhook(listen="0.0.0.0", port=int(os.environ.get("PORT", 5000)), url_path=bot_token)
-    updater.bot.set_webhook(url=f"https://{os.environ['RENDER_EXTERNAL_HOSTNAME']}/{bot_token}")
+    # Add handlers
+    application.add_handler(conv_handler)
+    application.add_error_handler(error_handler)
 
-    # Keep-alive
-    threading.Thread(target=start_keep_alive, daemon=True).start()
+    # Start the bot
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    updater.idle()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
