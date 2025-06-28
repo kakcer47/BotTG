@@ -8,11 +8,13 @@ from datetime import datetime, timedelta
 from typing import Dict, Set
 import aiohttp
 from aiohttp import web
-from telegram import Update, ChatPermissions
+from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, 
     CommandHandler, 
     MessageHandler, 
+    CallbackQueryHandler,
+    ChatMemberHandler,
     filters, 
     ContextTypes,
     CallbackContext
@@ -39,7 +41,8 @@ class MemoryOptimizedUserTracker:
         
         self.max_users = max_users
         self.cleanup_interval = cleanup_interval
-        self.last_cleanup = time.time()
+        # Добавляем множество для отслеживания пользователей, принявших правила
+        self.accepted_users: Dict[int, Set[int]] = defaultdict(set)
         
         # Слабые ссылки для автоматической очистки
         self._weak_refs = weakref.WeakSet()
@@ -143,14 +146,42 @@ class TelegramLimitBot:
         
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start"""
-        await update.message.reply_text(
-            "🤖 Бот-модератор активирован!\n\n"
-            "📋 Правила:\n"
-            "• Максимум 3 объявления на пользователя\n"
-            "• При превышении лимита - автоблокировка\n"
-            "• Удалите старые объявления для создания новых\n\n"
-            "⚡ Бот работает автономно и не требует настройки."
-        )
+        if not update.effective_chat or not update.effective_user:
+            return
+            
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        
+        # Если пользователь еще не принял правила, показываем их
+        if user_id not in self.tracker.accepted_users[chat_id]:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Принять правила", callback_data=f"accept_rules_{user_id}")
+            ]])
+            
+            await update.message.reply_text(
+                "👋 Добро пожаловать!\n\n"
+                "📋 **Правила чата:**\n"
+                "• Максимум 3 объявления на пользователя\n"
+                "• При превышении лимита - автоблокировка\n"
+                "• Удалите старые объявления для создания новых\n"
+                "• Запрещен спам и реклама\n"
+                "• Будьте вежливы и уважайте других участников\n\n"
+                "🔒 Для участия в чате нажмите кнопку ниже:",
+                reply_markup=keyboard,
+                parse_mode='Markdown'
+            )
+        else:
+            # Пользователь уже принял правила
+            message_count = self.tracker.get_message_count(chat_id, user_id)
+            await update.message.reply_text(
+                "🤖 Бот-модератор активен!\n\n"
+                f"📊 Ваш статус: {message_count}/3 объявлений\n\n"
+                "📋 Правила:\n"
+                "• Максимум 3 объявления на пользователя\n"
+                "• При превышении лимита - автоблокировка\n"
+                "• Удалите старые объявления для создания новых\n\n"
+                "💡 Команды: /status - проверить статус"
+            )
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик всех сообщений"""
@@ -167,6 +198,28 @@ class TelegramLimitBot:
         
         # Игнорируем команды
         if update.message.text and update.message.text.startswith('/'):
+            return
+        
+        # Проверяем, принял ли пользователь правила
+        if user_id not in self.tracker.accepted_users[chat_id]:
+            try:
+                await update.message.delete()
+                # Отправляем напоминание о правилах
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Принять правила", callback_data=f"accept_rules_{user_id}")
+                ]])
+                
+                reminder_msg = await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ {update.effective_user.first_name}, сначала примите правила чата!",
+                    reply_markup=keyboard
+                )
+                
+                # Удаляем напоминание через 30 секунд
+                asyncio.create_task(self._delete_message_later(context.bot, chat_id, reminder_msg.message_id, 30))
+                
+            except Exception as e:
+                logger.error(f"Ошибка при обработке сообщения от непринявшего правила: {e}")
             return
         
         # Проверяем, не ограничен ли уже пользователь
@@ -242,14 +295,130 @@ class TelegramLimitBot:
             except TelegramError as e:
                 logger.error(f"Ошибка при обработке превышения лимита: {e}")
     
-    async def handle_message_deletion(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик удаления сообщений"""
-        if not update.edited_message:
+    async def handle_new_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик новых участников чата"""
+        if not update.chat_member or not update.effective_chat:
             return
             
-        # Это довольно сложно отследить удаление через API
-        # Можно использовать chat_member updates или channel_post updates
-        pass
+        new_member = update.chat_member.new_chat_member
+        chat_id = update.effective_chat.id
+        user_id = new_member.user.id
+        
+        # Игнорируем ботов
+        if new_member.user.is_bot:
+            return
+            
+        # Проверяем, что пользователь действительно присоединился
+        if (update.chat_member.old_chat_member.status in ['left', 'kicked'] and 
+            new_member.status in ['member', 'restricted']):
+            
+            try:
+                # Сразу блокируем нового участника
+                await context.bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(
+                        can_send_messages=False,
+                        can_send_audios=False,
+                        can_send_documents=False,
+                        can_send_photos=False,
+                        can_send_videos=False,
+                        can_send_video_notes=False,
+                        can_send_voice_notes=False,
+                        can_send_polls=False,
+                        can_send_other_messages=False,
+                        can_add_web_page_previews=False
+                    )
+                )
+                
+                # Создаем кнопку принятия правил
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Принять правила", callback_data=f"accept_rules_{user_id}")
+                ]])
+                
+                # Отправляем правила
+                rules_text = (
+                    f"👋 Добро пожаловать, {new_member.user.first_name}!\n\n"
+                    f"📋 **Правила чата:**\n"
+                    f"• Максимум 3 объявления на пользователя\n"
+                    f"• При превышении лимита - автоблокировка\n"
+                    f"• Удалите старые объявления для создания новых\n"
+                    f"• Запрещен спам и реклама\n"
+                    f"• Будьте вежливы и уважайте других участников\n\n"
+                    f"🔒 Для участия в чате нажмите кнопку ниже:"
+                )
+                
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=rules_text,
+                    reply_markup=keyboard,
+                    parse_mode='Markdown'
+                )
+                
+                logger.info(f"Новый участник {user_id} заблокирован, отправлены правила")
+                
+            except Exception as e:
+                logger.error(f"Ошибка при обработке нового участника: {e}")
+    
+    async def handle_accept_rules(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик принятия правил"""
+        if not update.callback_query:
+            return
+            
+        query = update.callback_query
+        chat_id = update.effective_chat.id
+        
+        # Парсим callback_data
+        if not query.data.startswith("accept_rules_"):
+            return
+            
+        target_user_id = int(query.data.split("_")[-1])
+        current_user_id = update.effective_user.id
+        
+        # Проверяем, что кнопку нажал тот же пользователь
+        if current_user_id != target_user_id:
+            await query.answer("❌ Вы не можете принять правила за другого пользователя!", show_alert=True)
+            return
+        
+        try:
+            # Разблокируем пользователя
+            await context.bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=target_user_id,
+                permissions=ChatPermissions(
+                    can_send_messages=True,
+                    can_send_audios=True,
+                    can_send_documents=True,
+                    can_send_photos=True,
+                    can_send_videos=True,
+                    can_send_video_notes=True,
+                    can_send_voice_notes=True,
+                    can_send_polls=True,
+                    can_send_other_messages=True,
+                    can_add_web_page_previews=True
+                )
+            )
+            
+            # Добавляем в список принявших правила
+            self.tracker.accepted_users[chat_id].add(target_user_id)
+            
+            # Обновляем сообщение
+            await query.edit_message_text(
+                text=f"✅ Правила приняты!\n\n"
+                     f"🎉 Добро пожаловать в чат, {update.effective_user.first_name}!\n"
+                     f"📊 Вам доступно 3 объявления. Используйте их разумно.\n\n"
+                     f"💡 Команды:\n"
+                     f"/status - проверить количество объявлений",
+                parse_mode='Markdown'
+            )
+            
+            await query.answer("🎉 Добро пожаловать в чат!")
+            
+            logger.info(f"Пользователь {target_user_id} принял правила и разблокирован")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при принятии правил: {e}")
+            await query.answer("❌ Произошла ошибка. Обратитесь к администратору.", show_alert=True)
     
     async def _delete_message_later(self, bot, chat_id: int, message_id: int, delay: int):
         """Удаляет сообщение через заданное время"""
@@ -267,15 +436,33 @@ class TelegramLimitBot:
         chat_id = update.effective_chat.id
         user_id = update.effective_user.id
         
+        # Проверяем, принял ли пользователь правила
+        if user_id not in self.tracker.accepted_users[chat_id]:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Принять правила", callback_data=f"accept_rules_{user_id}")
+            ]])
+            
+            await update.message.reply_text(
+                "⚠️ Сначала примите правила чата для получения статуса!",
+                reply_markup=keyboard
+            )
+            return
+        
         message_count = self.tracker.get_message_count(chat_id, user_id)
         is_restricted = self.tracker.is_restricted(chat_id, user_id)
         
         status_text = f"📊 Ваш статус:\n"
         status_text += f"📝 Объявлений: {message_count}/3\n"
         status_text += f"🚫 Ограничен: {'Да' if is_restricted else 'Нет'}\n"
+        status_text += f"✅ Правила приняты: Да\n"
         
         if message_count >= 3:
             status_text += "\n⚠️ Лимит достигнут! Удалите старые объявления для создания новых."
+        elif is_restricted:
+            status_text += "\n🔒 Вы ограничены. Удалите старые объявления для разблокировки."
+        else:
+            remaining = 3 - message_count
+            status_text += f"\n✨ Осталось {remaining} объявлений"
         
         await update.message.reply_text(status_text)
     
@@ -361,6 +548,14 @@ async def main():
         # Добавляем обработчики
         bot.application.add_handler(CommandHandler("start", bot.start_command))
         bot.application.add_handler(CommandHandler("status", bot.status_command))
+        
+        # Обработчик новых участников
+        bot.application.add_handler(ChatMemberHandler(bot.handle_new_member, ChatMemberHandler.CHAT_MEMBER))
+        
+        # Обработчик кнопок
+        bot.application.add_handler(CallbackQueryHandler(bot.handle_accept_rules, pattern="accept_rules_"))
+        
+        # Обработчики сообщений
         bot.application.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message)
         )
@@ -392,7 +587,7 @@ async def main():
         await bot.application.bot.set_webhook(
             url=webhook_url,
             drop_pending_updates=True,
-            allowed_updates=['message', 'edited_message', 'channel_post', 'edited_channel_post']
+            allowed_updates=['message', 'edited_message', 'channel_post', 'edited_channel_post', 'chat_member', 'callback_query']
         )
         
         logger.info(f"🔗 Webhook установлен: {webhook_url}")
