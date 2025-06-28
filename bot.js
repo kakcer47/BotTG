@@ -6,8 +6,9 @@ const GROUP_ID = process.env.GROUP_ID;
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Хранилище пользовательских настроек
+// Хранилище пользовательских настроек и жалоб
 const userSettings = new Map();
+const messageComplaints = new Map(); // messageId -> Set(userIds)
 
 // Список доступных тем (замените на реальные ID из вашей группы)
 const TOPICS = {
@@ -35,6 +36,8 @@ bot.onText(/\/start/, async (msg) => {
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const data = query.data;
+    const userId = query.from.id;
+    const messageId = query.message.message_id;
     
     if (data.startsWith('topic_')) {
         const topicId = data.replace('topic_', '');
@@ -44,28 +47,97 @@ bot.on('callback_query', async (query) => {
         
         await bot.editMessageText(`Тема: ${topicName}\nТеперь ваши сообщения будут отправляться в эту тему.`, {
             chat_id: chatId,
-            message_id: query.message.message_id
+            message_id: messageId
         });
         
         await bot.answerCallbackQuery(query.id);
+    }
+    
+    // Обработка кнопок под сообщениями в группе
+    else if (data.startsWith('complain_')) {
+        const originalMessageId = data.replace('complain_', '');
+        
+        // Инициализируем счетчик жалоб для сообщения
+        if (!messageComplaints.has(originalMessageId)) {
+            messageComplaints.set(originalMessageId, new Set());
+        }
+        
+        const complaints = messageComplaints.get(originalMessageId);
+        
+        // Проверяем, не жаловался ли уже этот пользователь
+        if (complaints.has(userId)) {
+            await bot.answerCallbackQuery(query.id, { text: 'Вы уже пожаловались на это сообщение' });
+            return;
+        }
+        
+        complaints.add(userId);
+        
+        // Если жалоб 5 или больше - удаляем сообщение
+        if (complaints.size >= 5) {
+            try {
+                await bot.deleteMessage(GROUP_ID, originalMessageId);
+                await bot.answerCallbackQuery(query.id, { text: 'Сообщение удалено по жалобам' });
+                messageComplaints.delete(originalMessageId);
+            } catch (error) {
+                await bot.answerCallbackQuery(query.id, { text: 'Не удалось удалить сообщение' });
+            }
+        } else {
+            await bot.answerCallbackQuery(query.id, { text: `Жалоба принята (${complaints.size}/5)` });
+        }
+    }
+    
+    else if (data.startsWith('delete_')) {
+        const originalMessageId = data.replace('delete_', '');
+        
+        try {
+            // Удаляем только для пользователя кто нажал
+            await bot.deleteMessage(chatId, messageId);
+            await bot.answerCallbackQuery(query.id, { text: 'Сообщение скрыто для вас' });
+        } catch (error) {
+            await bot.answerCallbackQuery(query.id, { text: 'Не удалось скрыть сообщение' });
+        }
+    }
+    
+    else if (data.startsWith('forward_')) {
+        const originalMessageId = data.replace('forward_', '');
+        const groupIdNum = GROUP_ID.replace('-100', '');
+        const messageLink = `https://t.me/c/${groupIdNum}/${originalMessageId}`;
+        
+        try {
+            await bot.sendMessage(userId, `Ссылка на сообщение:\n${messageLink}`, {
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: 'Переслать', url: `tg://msg_url?url=${encodeURIComponent(messageLink)}` }
+                    ]]
+                }
+            });
+            await bot.answerCallbackQuery(query.id, { text: 'Ссылка отправлена в личные сообщения' });
+        } catch (error) {
+            await bot.answerCallbackQuery(query.id, { text: 'Сначала напишите боту в личку' });
+        }
+    }
+    
+    else if (data.startsWith('write_')) {
+        const authorId = data.replace('write_', '');
+        
+        try {
+            await bot.sendMessage(userId, `Написать автору:`, {
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: 'Открыть чат', url: `tg://user?id=${authorId}` }
+                    ]]
+                }
+            });
+            await bot.answerCallbackQuery(query.id, { text: 'Ссылка отправлена в личные сообщения' });
+        } catch (error) {
+            await bot.answerCallbackQuery(query.id, { text: 'Сначала напишите боту в личку' });
+        }
     }
 });
 
 // Команда для получения chat ID (для настройки)
 bot.onText(/\/id/, async (msg) => {
     await bot.sendMessage(msg.chat.id, `Chat ID: ${msg.chat.id}`);
-});
-
-// Команда для получения списка тем группы
-bot.onText(/\/topics/, async (msg) => {
-    const chatId = msg.chat.id;
-    try {
-        // Попробуем отправить тестовое сообщение без thread_id чтобы проверить доступ
-        await bot.sendMessage(GROUP_ID, 'Тест доступа к группе');
-        await bot.sendMessage(chatId, `Группа ID: ${GROUP_ID}\nДля получения ID тем:\n1. Откройте каждую тему в группе\n2. Скопируйте ссылку\n3. Последнее число в ссылке = ID темы\n\nПример: t.me/c/xxx/27 → ID темы: 27`);
-    } catch (error) {
-        await bot.sendMessage(chatId, `Ошибка доступа к группе: ${error.message}`);
-    }
 });
 
 // Команда быстрой настройки тем
@@ -95,10 +167,37 @@ bot.onText(/\/setup (.+)/, async (msg, match) => {
     }
 });
 
+// Добавление кнопок к сообщениям в группе
+bot.on('message', async (msg) => {
+    // Если сообщение в целевой группе и не от бота
+    if (msg.chat.id.toString() === GROUP_ID && !msg.from.is_bot && !msg.text?.startsWith('/')) {
+        try {
+            const keyboard = {
+                inline_keyboard: [[
+                    { text: '⚠️', callback_data: `complain_${msg.message_id}` },
+                    { text: '🗑', callback_data: `delete_${msg.message_id}` },
+                    { text: '↗️', callback_data: `forward_${msg.message_id}` },
+                    { text: '✉️', callback_data: `write_${msg.from.id}` }
+                ]]
+            };
+            
+            // Отправляем невидимое сообщение с кнопками
+            await bot.sendMessage(GROUP_ID, '‎', {
+                reply_to_message_id: msg.message_id,
+                reply_markup: keyboard,
+                parse_mode: 'HTML'
+            });
+        } catch (error) {
+            console.error('Ошибка добавления кнопок:', error);
+        }
+        return;
+    }
+});
+
 // Пересылка сообщений
 bot.on('message', async (msg) => {
-    // Игнорировать команды и callback запросы
-    if (msg.text?.startsWith('/') || msg.data) return;
+    // Игнорировать команды, callback запросы и сообщения из целевой группы
+    if (msg.text?.startsWith('/') || msg.data || msg.chat.id.toString() === GROUP_ID) return;
     
     const chatId = msg.chat.id;
     const userConfig = userSettings.get(chatId);
