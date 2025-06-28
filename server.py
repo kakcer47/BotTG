@@ -171,23 +171,26 @@ class TelegramLimitBot:
         user_id = update.effective_user.id
         
         try:
-            # Отправляем картинку
+            # Отправляем картинку без подписи
             with open('1.png', 'rb') as photo:
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")],
-                    [InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")]
-                ])
-                
-                await update.message.reply_photo(
-                    photo=photo,
-                    caption="👋 Добро пожаловать в бот для создания объявлений!\n\nВыберите язык:",
-                    reply_markup=keyboard
-                )
-        except FileNotFoundError:
-            # Если картинка не найдена, отправляем только текст
+                await update.message.reply_photo(photo=photo)
+            
+            # Отправляем кнопки выбора языка отдельным сообщением
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")],
-                [InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")]
+                [InlineKeyboardButton("Русский", callback_data="lang_ru")],
+                [InlineKeyboardButton("English", callback_data="lang_en")]
+            ])
+            
+            await update.message.reply_text(
+                "Выберите язык:",
+                reply_markup=keyboard
+            )
+            
+        except FileNotFoundError:
+            # Если картинка не найдена, отправляем только текст с кнопками
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Русский", callback_data="lang_ru")],
+                [InlineKeyboardButton("English", callback_data="lang_en")]
             ])
             
             await update.message.reply_text(
@@ -223,16 +226,16 @@ class TelegramLimitBot:
             
             keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_lang")])
             
-            await query.edit_message_caption(
-                caption="📋 Выберите категорию объявления:",
+            await query.edit_message_text(
+                text="📋 Выберите категорию объявления:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             
             return CATEGORY_SELECTION
             
         elif query.data == "lang_en":
-            await query.edit_message_caption(
-                caption="🚧 English version is coming soon!\n\nАнглийская версия скоро будет доступна!",
+            await query.edit_message_text(
+                text="🚧 English version is coming soon!\n\nАнглийская версия скоро будет доступна!",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_lang")]])
             )
             return LANGUAGE_SELECTION
@@ -244,12 +247,12 @@ class TelegramLimitBot:
         
         if query.data == "back_to_lang":
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")],
-                [InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")]
+                [InlineKeyboardButton("Русский", callback_data="lang_ru")],
+                [InlineKeyboardButton("English", callback_data="lang_en")]
             ])
             
-            await query.edit_message_caption(
-                caption="👋 Добро пожаловать в бот для создания объявлений!\n\nВыберите язык:",
+            await query.edit_message_text(
+                text="Выберите язык:",
                 reply_markup=keyboard
             )
             return LANGUAGE_SELECTION
@@ -265,14 +268,14 @@ class TelegramLimitBot:
                 [InlineKeyboardButton("⬅️ Выбрать другую категорию", callback_data="back_to_categories")]
             ])
             
-            await query.edit_message_caption(
-                caption=f"📝 Пример объявления:\n\n"
-                        f"{example}\n"
-                        f"Напишите ваше объявление, указав:\n"
-                        f"• Пол (ваш)\n"
-                        f"• Город (где ищете друзей)\n"
-                        f"• Дату (когда будет происходить встреча с/по)\n\n"
-                        f"Если будет корректным - мы его отправим в группу!",
+            await query.edit_message_text(
+                text=f"📝 Пример объявления:\n\n"
+                     f"{example}\n"
+                     f"Напишите ваше объявление, указав:\n"
+                     f"• Пол (ваш)\n"
+                     f"• Город (где ищете друзей)\n"
+                     f"• Дату (когда будет происходить встреча с/по)\n\n"
+                     f"Если будет корректным - мы его отправим в группу!",
                 reply_markup=keyboard
             )
             
@@ -1014,16 +1017,12 @@ async def main():
                 CallbackQueryHandler(bot.handle_callbacks, pattern="^(create_another|my_posts|start_delete|back_to_lang)$")
             ],
             per_user=True,
-            per_chat=False
+            per_chat=False,
+            per_message=True  # Исправляем warning
         )
         
         # Добавляем обработчики
         bot.application.add_handler(conversation_handler)
-        
-        # Обработчики для работы в группе (опционально)
-        if TARGET_GROUP_ID:
-            bot.application.add_handler(ChatMemberHandler(bot.handle_new_member, ChatMemberHandler.CHAT_MEMBER))
-            bot.application.add_handler(CallbackQueryHandler(bot.handle_accept_rules, pattern="accept_rules_"))
         
         # Глобальный обработчик callback-ов
         bot.application.add_handler(CallbackQueryHandler(bot.handle_callbacks))
