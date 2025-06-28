@@ -7,6 +7,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Dict, Set
 import aiohttp
+from aiohttp import web
 from telegram import Update, ChatMember
 from telegram.ext import (
     Application, 
@@ -341,7 +342,6 @@ class TelegramLimitBot:
 # Функция для веб-сервера (keep-alive endpoint)
 async def create_web_server():
     """Создает простой веб-сервер для keep-alive"""
-    from aiohttp import web
     
     async def health_check(request):
         return web.Response(text="Bot is alive!", status=200)
