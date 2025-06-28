@@ -27,8 +27,9 @@ CATEGORY, GENDER, LOCATION, DATE, ANNOUNCEMENT = range(5)
 # Environment variables
 import os
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://your-bot.onrender.com")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+WEBHOOK_PATH = "/webhook"
 
 # Function to ping the bot to prevent Render from idling
 def ping_self():
@@ -249,9 +250,18 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors during conversation."""
     logger.error(f"Update {update} caused error {context.error}")
-    if update.message:
+    if update and update.message:
         await update.message.reply_text("An error occurred. Please try again.")
+    else:
+        logger.warning("No update.message available, skipping reply")
     return ConversationHandler.END
+
+async def set_webhook():
+    """Set the webhook for the bot."""
+    webhook_url = f"{RENDER_URL}{WEBHOOK_PATH}"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}"
+    response = requests.get(url)
+    logger.info(f"Set webhook response: {response.json()}")
 
 def main():
     """Run the bot."""
@@ -281,9 +291,16 @@ def main():
     application.add_handler(conv_handler)
     application.add_error_handler(error_handler)
 
-    # Start the bot
-    logger.info("Starting bot polling")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Set webhook and start the bot
+    logger.info("Setting webhook and starting bot")
+    import asyncio
+    asyncio.run(set_webhook())
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=10000,
+        url_path=WEBHOOK_PATH,
+        webhook_url=f"{RENDER_URL}{WEBHOOK_PATH}"
+    )
 
 if __name__ == "__main__":
     main()
