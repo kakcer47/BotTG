@@ -1,7 +1,6 @@
 import os
 import asyncio
 import logging
-import psycopg
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
@@ -19,172 +18,103 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-DATABASE_URL = os.getenv('DATABASE_URL')
 GROUP_ID = os.getenv('GROUP_ID')  # ID группы где публиковать
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')  # URL для webhook
 PORT = int(os.getenv('PORT', 8443))
 
-class Database:
-    def __init__(self, database_url):
-        self.database_url = database_url
-        self.init_db()
-    
-    def get_connection(self):
-        return psycopg.connect(self.database_url)
-    
-    def init_db(self):
-        """Инициализация базы данных"""
-        try:
-            with psycopg.connect(self.database_url) as conn:
-                with conn.cursor() as cur:
-                    # Таблица пользователей с лимитами
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS users (
-                            user_id BIGINT PRIMARY KEY,
-                            language VARCHAR(10) DEFAULT 'ru',
-                            ads_count INTEGER DEFAULT 0,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                    """)
-                    
-                    # Таблица объявлений
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS ads (
-                            id SERIAL PRIMARY KEY,
-                            user_id BIGINT NOT NULL,
-                            message_id INTEGER NOT NULL,
-                            topic_id INTEGER NOT NULL,
-                            topic_name VARCHAR(255) NOT NULL,
-                            complaints INTEGER DEFAULT 0,
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            FOREIGN KEY (user_id) REFERENCES users(user_id)
-                        )
-                    """)
-                    
-                    # Индексы для оптимизации
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_ads_user_id ON ads(user_id)")
-                    cur.execute("CREATE INDEX IF NOT EXISTS idx_ads_message_id ON ads(message_id)")
-                    
-                conn.commit()
-                logger.info("Database initialized successfully")
-        except Exception as e:
-            logger.error(f"Database initialization failed: {e}")
-            # Бот может работать без БД (ограниченно)
+class MemoryDatabase:
+    def __init__(self):
+        # Хранение данных в памяти
+        self.users = {}  # {user_id: {'language': 'ru', 'ads_count': 0}}
+        self.ads = {}    # {ad_id: {'user_id': int, 'message_id': int, 'topic_id': int, 'topic_name': str, 'complaints': 0, 'created_at': datetime}}
+        self.ad_counter = 1
+        logger.info("Memory database initialized successfully")
     
     def get_user(self, user_id):
         """Получить данные пользователя"""
-        try:
-            with psycopg.connect(self.database_url) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
-                    return cur.fetchone()
-        except Exception as e:
-            logger.error(f"Database error in get_user: {e}")
-            return None
+        user_data = self.users.get(user_id)
+        if user_data:
+            return (user_id, user_data['language'], user_data['ads_count'], user_data.get('created_at'))
+        return None
     
     def create_or_update_user(self, user_id, language='ru'):
         """Создать или обновить пользователя"""
-        try:
-            with psycopg.connect(self.database_url) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO users (user_id, language) 
-                        VALUES (%s, %s) 
-                        ON CONFLICT (user_id) 
-                        DO UPDATE SET language = EXCLUDED.language
-                    """, (user_id, language))
-                conn.commit()
-        except Exception as e:
-            logger.error(f"Database error in create_or_update_user: {e}")
+        if user_id not in self.users:
+            self.users[user_id] = {
+                'language': language,
+                'ads_count': 0,
+                'created_at': datetime.now()
+            }
+        else:
+            self.users[user_id]['language'] = language
     
     def get_user_ads(self, user_id):
         """Получить объявления пользователя"""
-        try:
-            with psycopg.connect(self.database_url) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        SELECT id, message_id, topic_id, topic_name, created_at 
-                        FROM ads WHERE user_id = %s ORDER BY created_at DESC
-                    """, (user_id,))
-                    return cur.fetchall()
-        except Exception as e:
-            logger.error(f"Database error in get_user_ads: {e}")
-            return []
+        user_ads = []
+        for ad_id, ad_data in self.ads.items():
+            if ad_data['user_id'] == user_id:
+                user_ads.append((
+                    ad_id,
+                    ad_data['message_id'],
+                    ad_data['topic_id'],
+                    ad_data['topic_name'],
+                    ad_data['created_at']
+                ))
+        # Сортировка по дате создания (новые первые)
+        user_ads.sort(key=lambda x: x[4], reverse=True)
+        return user_ads
     
     def add_ad(self, user_id, message_id, topic_id, topic_name):
         """Добавить объявление"""
-        try:
-            with psycopg.connect(self.database_url) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO ads (user_id, message_id, topic_id, topic_name) 
-                        VALUES (%s, %s, %s, %s)
-                    """, (user_id, message_id, topic_id, topic_name))
-                    
-                    cur.execute("""
-                        UPDATE users SET ads_count = ads_count + 1 
-                        WHERE user_id = %s
-                    """, (user_id,))
-                conn.commit()
-        except Exception as e:
-            logger.error(f"Database error in add_ad: {e}")
+        ad_id = self.ad_counter
+        self.ad_counter += 1
+        
+        self.ads[ad_id] = {
+            'user_id': user_id,
+            'message_id': message_id,
+            'topic_id': topic_id,
+            'topic_name': topic_name,
+            'complaints': 0,
+            'created_at': datetime.now()
+        }
+        
+        # Увеличить счетчик объявлений пользователя
+        if user_id in self.users:
+            self.users[user_id]['ads_count'] += 1
     
     def delete_ad(self, ad_id, user_id):
         """Удалить объявление"""
-        try:
-            with psycopg.connect(self.database_url) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("DELETE FROM ads WHERE id = %s AND user_id = %s", (ad_id, user_id))
-                    deleted = cur.rowcount > 0
-                    if deleted:
-                        cur.execute("""
-                            UPDATE users SET ads_count = ads_count - 1 
-                            WHERE user_id = %s AND ads_count > 0
-                        """, (user_id,))
-                conn.commit()
-                return deleted
-        except Exception as e:
-            logger.error(f"Database error in delete_ad: {e}")
-            return False
+        if ad_id in self.ads and self.ads[ad_id]['user_id'] == user_id:
+            del self.ads[ad_id]
+            # Уменьшить счетчик объявлений пользователя
+            if user_id in self.users and self.users[user_id]['ads_count'] > 0:
+                self.users[user_id]['ads_count'] -= 1
+            return True
+        return False
     
     def add_complaint(self, message_id):
         """Добавить жалобу к объявлению"""
-        try:
-            with psycopg.connect(self.database_url) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("""
-                        UPDATE ads SET complaints = complaints + 1 
-                        WHERE message_id = %s RETURNING complaints, user_id, topic_name
-                    """, (message_id,))
-                    result = cur.fetchone()
-                conn.commit()
-                return result
-        except Exception as e:
-            logger.error(f"Database error in add_complaint: {e}")
-            return None
+        for ad_id, ad_data in self.ads.items():
+            if ad_data['message_id'] == message_id:
+                ad_data['complaints'] += 1
+                return (ad_data['complaints'], ad_data['user_id'], ad_data['topic_name'])
+        return None
     
     def delete_ad_by_message_id(self, message_id):
         """Удалить объявление по message_id"""
-        try:
-            with psycopg.connect(self.database_url) as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT user_id FROM ads WHERE message_id = %s", (message_id,))
-                    user_data = cur.fetchone()
-                    if user_data:
-                        cur.execute("DELETE FROM ads WHERE message_id = %s", (message_id,))
-                        cur.execute("""
-                            UPDATE users SET ads_count = ads_count - 1 
-                            WHERE user_id = %s AND ads_count > 0
-                        """, (user_data[0],))
-                conn.commit()
-                return user_data[0] if user_data else None
-        except Exception as e:
-            logger.error(f"Database error in delete_ad_by_message_id: {e}")
-            return None
+        for ad_id, ad_data in self.ads.items():
+            if ad_data['message_id'] == message_id:
+                user_id = ad_data['user_id']
+                del self.ads[ad_id]
+                # Уменьшить счетчик объявлений пользователя
+                if user_id in self.users and self.users[user_id]['ads_count'] > 0:
+                    self.users[user_id]['ads_count'] -= 1
+                return user_id
+        return None
 
 class TelegramBot:
     def __init__(self):
-        self.db = Database(DATABASE_URL)
+        self.db = MemoryDatabase()
         self.app = Application.builder().token(BOT_TOKEN).build()
         self.user_states = {}  # Хранение состояний пользователей в памяти
         
@@ -225,9 +155,6 @@ class TelegramBot:
     async def get_group_topics(self):
         """Получить темы из группы"""
         try:
-            # Пытаемся получить темы через API (для групп с включенными темами)
-            # В реальном API нужно использовать getForumTopicIconStickers или подобный метод
-            # Пока используем статический список
             return [
                 {'id': 1, 'name': 'Общение'},
                 {'id': 2, 'name': 'Работа'},
@@ -458,8 +385,7 @@ class TelegramBot:
                 try:
                     with urllib.request.urlopen(f"{WEBHOOK_URL}/", timeout=10) as response:
                         return response.status
-                except Exception as e:
-                    logger.error(f"Self-ping error: {e}")
+                except Exception:
                     return None
             
             # Выполняем синхронный запрос в отдельном потоке
@@ -468,7 +394,9 @@ class TelegramBot:
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 status = await loop.run_in_executor(executor, ping_sync)
                 if status:
-                    logger.info(f"Self-ping successful: {status}")
+                    logger.info(f"🔄 Self-ping successful: {status}")
+                else:
+                    logger.info("🔄 Self-ping executed (no status)")
         except Exception as e:
             logger.error(f"Self-ping error: {e}")
     
@@ -478,9 +406,13 @@ class TelegramBot:
         self.app.add_handler(CallbackQueryHandler(self.button_callback))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         
-        # Самопинг каждые 25 минут
+        # Самопинг каждые 25 минут (1500 секунд)
         job_queue = self.app.job_queue
-        job_queue.run_repeating(self.self_ping, interval=1500, first=10)
+        if job_queue:
+            job_queue.run_repeating(self.self_ping, interval=1500, first=10)
+            logger.info("🔄 Self-ping scheduled every 25 minutes")
+        else:
+            logger.warning("⚠️ JobQueue not available - self-ping disabled")
     
     async def run_webhook(self):
         """Запуск с webhook для Render"""
@@ -490,6 +422,7 @@ class TelegramBot:
         # Установка webhook
         webhook_url = f"{WEBHOOK_URL}/webhook"
         await self.app.bot.set_webhook(webhook_url)
+        logger.info(f"🌐 Webhook set to: {webhook_url}")
         
         # Запуск webhook сервера
         await self.app.run_webhook(
@@ -504,12 +437,19 @@ class TelegramBot:
         await self.app.run_polling(drop_pending_updates=True)
 
 async def main():
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN не задан!")
+        return
+    
+    logger.info("🚀 Запуск Telegram бота...")
     bot = TelegramBot()
     bot.setup_handlers()
     
     if WEBHOOK_URL:
+        logger.info("🌐 Режим: Webhook (для продакшена)")
         await bot.run_webhook()
     else:
+        logger.info("🔄 Режим: Polling (для разработки)")
         await bot.run_polling()
 
 if __name__ == "__main__":
