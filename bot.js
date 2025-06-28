@@ -4,11 +4,32 @@ const TelegramBot = require('node-telegram-bot-api');
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GROUP_ID = process.env.GROUP_ID;
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// Инициализация бота с обработкой конфликтов
+const bot = new TelegramBot(BOT_TOKEN, { 
+    polling: {
+        interval: 300,
+        autoStart: true,
+        params: {
+            timeout: 10
+        }
+    }
+});
+
+// Обработка ошибок polling
+bot.on('polling_error', (error) => {
+    console.log('Polling error:', error.message);
+    if (error.message.includes('409 Conflict')) {
+        console.log('Останавливаю конфликтующий экземпляр...');
+        setTimeout(() => {
+            process.exit(1);
+        }, 5000);
+    }
+});
 
 // Хранилище пользовательских настроек и жалоб
 const userSettings = new Map();
 const messageComplaints = new Map(); // messageId -> Set(userIds)
+const groupSettings = new Map(); // chatId -> { moderationEnabled: true/false }
 
 // Список доступных тем (замените на реальные ID из вашей группы)
 const TOPICS = {
@@ -90,11 +111,11 @@ bot.on('callback_query', async (query) => {
         const originalMessageId = data.replace('delete_', '');
         
         try {
-            // Удаляем только для пользователя кто нажал
+            // Удаляем панель модерации для пользователя
             await bot.deleteMessage(chatId, messageId);
-            await bot.answerCallbackQuery(query.id, { text: 'Сообщение скрыто для вас' });
+            await bot.answerCallbackQuery(query.id, { text: 'Панель скрыта' });
         } catch (error) {
-            await bot.answerCallbackQuery(query.id, { text: 'Не удалось скрыть сообщение' });
+            await bot.answerCallbackQuery(query.id, { text: 'Не удалось скрыть панель' });
         }
     }
     
@@ -138,6 +159,43 @@ bot.on('callback_query', async (query) => {
 // Команда для получения chat ID (для настройки)
 bot.onText(/\/id/, async (msg) => {
     await bot.sendMessage(msg.chat.id, `Chat ID: ${msg.chat.id}`);
+});
+
+// Команда для перезапуска (для решения конфликтов)
+bot.onText(/\/restart/, async (msg) => {
+    const chatId = msg.chat.id;
+    await bot.sendMessage(chatId, 'Перезапуск...');
+    process.exit(0);
+});
+
+// Команды для управления панелью модерации
+bot.onText(/\/moderation (on|off)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const action = match[1];
+    
+    // Проверяем, что команда в группе
+    if (chatId.toString() !== GROUP_ID) {
+        await bot.sendMessage(chatId, 'Команда работает только в настроенной группе');
+        return;
+    }
+    
+    // Проверяем права администратора
+    try {
+        const member = await bot.getChatMember(chatId, msg.from.id);
+        if (!['creator', 'administrator'].includes(member.status)) {
+            await bot.sendMessage(chatId, 'Только администраторы могут управлять панелью модерации');
+            return;
+        }
+    } catch (error) {
+        console.error('Ошибка проверки прав:', error);
+        return;
+    }
+    
+    const settings = groupSettings.get(chatId) || {};
+    settings.moderationEnabled = (action === 'on');
+    groupSettings.set(chatId, settings);
+    
+    await bot.sendMessage(chatId, `Панель модерации ${action === 'on' ? 'включена' : 'выключена'}`);
 });
 
 // Команда быстрой настройки тем
