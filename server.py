@@ -3,18 +3,20 @@ import logging
 import os
 import time
 import threading
+import json
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
-from typing import Dict, Set
+from typing import Dict, Set, Optional, List
 import aiohttp
 from aiohttp import web
-from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
     Application, 
     CommandHandler, 
     MessageHandler, 
     CallbackQueryHandler,
     ChatMemberHandler,
+    ConversationHandler,
     filters, 
     ContextTypes,
     CallbackContext
@@ -22,6 +24,7 @@ from telegram.ext import (
 from telegram.error import TelegramError
 import gc
 import weakref
+import re
 
 # Настройка логирования
 logging.basicConfig(
@@ -29,6 +32,15 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Состояния для ConversationHandler
+LANGUAGE_SELECTION = 1
+CATEGORY_SELECTION = 2
+WRITING_POST = 3
+DELETE_SELECTION = 4
+
+# Конфигурация
+TARGET_GROUP_ID = os.getenv('TARGET_GROUP_ID')  # ID группы куда отправлять объявления
 
 class MemoryOptimizedUserTracker:
     """Оптимизированный трекер пользователей с управлением памятью"""
@@ -117,6 +129,7 @@ class MemoryOptimizedUserTracker:
                 self.last_activity[chat_id].pop(user_id, None)
                 self.user_messages[chat_id].pop(user_id, None)
                 self.user_restrictions[chat_id].discard(user_id)
+                self.accepted_users[chat_id].discard(user_id)
             
             # Удаляем пустые чаты
             if not self.last_activity[chat_id]:
@@ -126,6 +139,7 @@ class MemoryOptimizedUserTracker:
             self.last_activity.pop(chat_id, None)
             self.user_messages.pop(chat_id, None)
             self.user_restrictions.pop(chat_id, None)
+            self.accepted_users.pop(chat_id, None)
         
         self.last_cleanup = current_time
         
@@ -135,14 +149,311 @@ class MemoryOptimizedUserTracker:
         logger.info(f"Очистка памяти завершена. Активных чатов: {len(self.last_activity)}")
 
 class TelegramLimitBot:
-    """Основной класс бота с системой лимитов"""
+    """Основной класс бота с системой объявлений"""
     
-    def __init__(self, token: str, render_url: str = None):
+    def __init__(self, token: str, render_url: str = None, target_group_id: str = None):
         self.token = token
         self.render_url = render_url
+        self.target_group_id = int(target_group_id) if target_group_id else None
         self.application = None
         self.tracker = MemoryOptimizedUserTracker()
         self.keep_alive_task = None
+        
+        # Примеры объявлений по категориям
+        self.examples = {
+            "friends": "Женщина. Москва. 24.06/04.07 (или \"любое время\")\n\nВсем привет, ищу друга для общения и обсуждения глубоких тем по философии.\n",
+            "travel": "Мужчина. Санкт-Петербург. 15.07/20.07\n\nПланирую поездку в горы, ищу попутчиков для совместного путешествия.\n",
+            "business": "Женщина. Екатеринбург. любое время\n\nИщу партнера для открытия кафе, есть опыт в ресторанном бизнесе.\n"
+        }
+    
+    async def start_conversation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начало разговора - показ главного меню с картинкой"""
+        user_id = update.effective_user.id
+        
+        try:
+            # Отправляем картинку
+            with open('1.png', 'rb') as photo:
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")],
+                    [InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")]
+                ])
+                
+                await update.message.reply_photo(
+                    photo=photo,
+                    caption="👋 Добро пожаловать в бот для создания объявлений!\n\nВыберите язык:",
+                    reply_markup=keyboard
+                )
+        except FileNotFoundError:
+            # Если картинка не найдена, отправляем только текст
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")],
+                [InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")]
+            ])
+            
+            await update.message.reply_text(
+                "👋 Добро пожаловать в бот для создания объявлений!\n\nВыберите язык:",
+                reply_markup=keyboard
+            )
+        
+        return LANGUAGE_SELECTION
+    
+    async def language_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка выбора языка"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "lang_ru":
+            # Обновляем топики из группы
+            await self.update_topics()
+            
+            # Создаем кнопки категорий
+            keyboard = []
+            topics = self.tracker.get_topics()
+            
+            if topics:
+                for topic_id, topic_name in topics.items():
+                    keyboard.append([InlineKeyboardButton(f"📂 {topic_name}", callback_data=f"category_{topic_id}")])
+            else:
+                # Если топики не получены, используем дефолтные
+                keyboard = [
+                    [InlineKeyboardButton("👥 Друзья и общение", callback_data="category_friends")],
+                    [InlineKeyboardButton("✈️ Путешествия", callback_data="category_travel")],
+                    [InlineKeyboardButton("💼 Бизнес", callback_data="category_business")]
+                ]
+            
+            keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_to_lang")])
+            
+            await query.edit_message_caption(
+                caption="📋 Выберите категорию объявления:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+            return CATEGORY_SELECTION
+            
+        elif query.data == "lang_en":
+            await query.edit_message_caption(
+                caption="🚧 English version is coming soon!\n\nАнглийская версия скоро будет доступна!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_to_lang")]])
+            )
+            return LANGUAGE_SELECTION
+    
+    async def category_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка выбора категории"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "back_to_lang":
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")],
+                [InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")]
+            ])
+            
+            await query.edit_message_caption(
+                caption="👋 Добро пожаловать в бот для создания объявлений!\n\nВыберите язык:",
+                reply_markup=keyboard
+            )
+            return LANGUAGE_SELECTION
+        
+        if query.data.startswith("category_"):
+            category = query.data.replace("category_", "")
+            context.user_data['selected_category'] = category
+            
+            # Получаем пример объявления
+            example = self.examples.get(category, self.examples["friends"])
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Выбрать другую категорию", callback_data="back_to_categories")]
+            ])
+            
+            await query.edit_message_caption(
+                caption=f"📝 Пример объявления:\n\n"
+                        f"{example}\n"
+                        f"Напишите ваше объявление, указав:\n"
+                        f"• Пол (ваш)\n"
+                        f"• Город (где ищете друзей)\n"
+                        f"• Дату (когда будет происходить встреча с/по)\n\n"
+                        f"Если будет корректным - мы его отправим в группу!",
+                reply_markup=keyboard
+            )
+            
+            return WRITING_POST
+    
+    async def process_user_post(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка объявления от пользователя"""
+        user_id = update.effective_user.id
+        user_text = update.message.text
+        
+        # Проверяем лимит объявлений
+        posts_count = self.tracker.get_user_posts_count(user_id)
+        if posts_count >= 3:
+            # Показываем меню удаления
+            return await self.show_delete_menu(update, context)
+        
+        # Валидируем объявление
+        if self.validate_post(user_text):
+            category = context.user_data.get('selected_category', 'friends')
+            
+            # Отправляем в группу
+            message_id = await self.send_to_group(user_text, user_id, category)
+            
+            if message_id:
+                # Добавляем в трекер
+                topic_id = self.get_topic_id_by_category(category)
+                self.tracker.add_post(user_id, topic_id, message_id)
+                
+                # Показываем успех
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📝 Создать еще объявление", callback_data="create_another")],
+                    [InlineKeyboardButton("📊 Мои объявления", callback_data="my_posts")]
+                ])
+                
+                await update.message.reply_text(
+                    "✅ Объявление успешно отправлено в группу!\n\n"
+                    f"📊 Ваших объявлений: {posts_count + 1}/3",
+                    reply_markup=keyboard
+                )
+            else:
+                await update.message.reply_text(
+                    "❌ Ошибка при отправке объявления. Попробуйте позже.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Попробовать снова", callback_data="retry_send")]])
+                )
+        else:
+            await update.message.reply_text(
+                "❌ Объявление не соответствует формату!\n\n"
+                "Пожалуйста, укажите:\n"
+                "• Пол (ваш)\n"
+                "• Город\n"
+                "• Дату или 'любое время'\n\n"
+                "Попробуйте еще раз:"
+            )
+        
+        return WRITING_POST
+    
+    async def show_delete_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает меню удаления объявлений"""
+        user_id = update.effective_user.id
+        user_posts = self.tracker.get_user_posts_by_topic(user_id)
+        
+        if not user_posts:
+            await update.message.reply_text(
+                "У вас нет активных объявлений.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📝 Создать объявление", callback_data="create_new")]])
+            )
+            return CATEGORY_SELECTION
+        
+        keyboard = []
+        topics = self.tracker.get_topics()
+        
+        for topic_id, message_ids in user_posts.items():
+            topic_name = topics.get(topic_id, f"Тема {topic_id}")
+            posts_count = len(message_ids)
+            keyboard.append([InlineKeyboardButton(
+                f"🗑️ {topic_name} ({posts_count} объявл.)", 
+                callback_data=f"delete_topic_{topic_id}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("⬅️ Назад к категориям", callback_data="back_to_categories")])
+        
+        await update.message.reply_text(
+            "🚫 Лимит 3 объявления достигнут!\n\n"
+            "Удалите старые объявления, чтобы создать новые.\n"
+            "Какое объявление вы хотите удалить?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        return DELETE_SELECTION
+    
+    def validate_post(self, text: str) -> bool:
+        """Простая валидация объявления"""
+        text_lower = text.lower()
+        
+        # Проверяем наличие пола
+        has_gender = any(word in text_lower for word in ['мужчина', 'женщина', 'парень', 'девушка', 'м.', 'ж.'])
+        
+        # Проверяем наличие города (упрощенно - наличие заглавной буквы в середине)
+        has_city = bool(re.search(r'\b[А-ЯЁ][а-яё]+', text))
+        
+        # Проверяем наличие даты или "любое время"
+        has_date = any(word in text_lower for word in ['любое время', '.', '/', 'время', 'дата']) or \
+                   bool(re.search(r'\d{1,2}[./]\d{1,2}', text))
+        
+        return has_gender and has_city and has_date
+    
+    async def send_to_group(self, text: str, user_id: int, category: str) -> Optional[int]:
+        """Отправляет объявление в группу"""
+        if not self.target_group_id:
+            logger.error("TARGET_GROUP_ID не установлен")
+            return None
+        
+        try:
+            # Формируем ссылку на пользователя
+            user = await self.application.bot.get_chat(user_id)
+            if user.username:
+                user_link = f"https://t.me/{user.username}"
+            else:
+                user_link = f"tg://user?id={user_id}"
+            
+            # Формируем сообщение
+            full_text = f"{text}\n\n**[Написать]({user_link})**"
+            
+            # Получаем ID темы
+            topic_id = self.get_topic_id_by_category(category)
+            
+            # Отправляем в группу
+            message = await self.application.bot.send_message(
+                chat_id=self.target_group_id,
+                text=full_text,
+                parse_mode='Markdown',
+                message_thread_id=topic_id if topic_id else None
+            )
+            
+            return message.message_id
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки в группу: {e}")
+            return None
+    
+    def get_topic_id_by_category(self, category: str) -> Optional[int]:
+        """Получает ID темы по категории"""
+        topics = self.tracker.get_topics()
+        
+        # Если есть реальные топики группы, используем их
+        if topics:
+            for topic_id, topic_name in topics.items():
+                if category in topic_name.lower() or any(word in topic_name.lower() for word in category.split('_')):
+                    return topic_id
+            # Возвращаем первый доступный топик
+            return next(iter(topics.keys()))
+        
+        # Иначе возвращаем None (отправка в основной чат)
+        return None
+    
+    async def update_topics(self):
+        """Обновляет список тем из группы"""
+        if not self.target_group_id:
+            return
+        
+        try:
+            # Попытка получить информацию о форуме (темах)
+            # Это упрощенная версия - в реальности нужно использовать getForumTopicIconStickers
+            # Пока используем дефолтные темы
+            default_topics = {
+                1: "👥 Друзья и общение",
+                2: "✈️ Путешествия", 
+                3: "💼 Бизнес и работа"
+            }
+            
+            self.tracker.set_topics(default_topics)
+            logger.info(f"Обновлены темы: {default_topics}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения тем: {e}")
+            # Устанавливаем дефолтные темы
+            self.tracker.set_topics({
+                1: "👥 Друзья и общение",
+                2: "✈️ Путешествия",
+                3: "💼 Бизнес и работа"
+            })
         
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start"""
@@ -295,7 +606,144 @@ class TelegramLimitBot:
             except TelegramError as e:
                 logger.error(f"Ошибка при обработке превышения лимита: {e}")
     
-    async def handle_new_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def handle_callbacks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка различных callback-ов"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "create_another":
+            # Возвращаемся к выбору категории
+            await self.update_topics()
+            
+            keyboard = []
+            topics = self.tracker.get_topics()
+            
+            for topic_id, topic_name in topics.items():
+                keyboard.append([InlineKeyboardButton(f"📂 {topic_name}", callback_data=f"category_{topic_id}")])
+            
+            keyboard.append([InlineKeyboardButton("⬅️ В главное меню", callback_data="back_to_lang")])
+            
+            await query.edit_message_text(
+                text="📋 Выберите категорию для нового объявления:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return CATEGORY_SELECTION
+            
+        elif query.data == "my_posts":
+            # Показываем статистику объявлений
+            user_id = update.effective_user.id
+            user_posts = self.tracker.get_user_posts_by_topic(user_id)
+            total_posts = self.tracker.get_user_posts_count(user_id)
+            
+            if user_posts:
+                stats_text = f"📊 Ваши объявления ({total_posts}/3):\n\n"
+                topics = self.tracker.get_topics()
+                
+                for topic_id, message_ids in user_posts.items():
+                    topic_name = topics.get(topic_id, f"Тема {topic_id}")
+                    stats_text += f"📂 {topic_name}: {len(message_ids)} объявл.\n"
+                
+                keyboard = [
+                    [InlineKeyboardButton("🗑️ Удалить объявление", callback_data="start_delete")],
+                    [InlineKeyboardButton("📝 Создать новое", callback_data="create_another")]
+                ]
+            else:
+                stats_text = "У вас пока нет активных объявлений."
+                keyboard = [[InlineKeyboardButton("📝 Создать объявление", callback_data="create_another")]]
+            
+            await query.edit_message_text(
+                text=stats_text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        elif query.data == "start_delete":
+            return await self.show_delete_menu_callback(update, context)
+            
+        elif query.data.startswith("delete_topic_"):
+            return await self.handle_topic_deletion(update, context)
+    
+    async def show_delete_menu_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает меню удаления через callback"""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        user_posts = self.tracker.get_user_posts_by_topic(user_id)
+        
+        if not user_posts:
+            await query.edit_message_text(
+                text="У вас нет активных объявлений.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📝 Создать объявление", callback_data="create_another")]])
+            )
+            return CATEGORY_SELECTION
+        
+        keyboard = []
+        topics = self.tracker.get_topics()
+        
+        for topic_id, message_ids in user_posts.items():
+            topic_name = topics.get(topic_id, f"Тема {topic_id}")
+            posts_count = len(message_ids)
+            keyboard.append([InlineKeyboardButton(
+                f"🗑️ {topic_name} ({posts_count} объявл.)", 
+                callback_data=f"delete_topic_{topic_id}"
+            )])
+        
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="my_posts")])
+        
+        await query.edit_message_text(
+            text="🗑️ Какие объявления удалить?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        return DELETE_SELECTION
+    
+    async def handle_topic_deletion(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка удаления объявлений из конкретной темы"""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        topic_id = int(query.data.replace("delete_topic_", ""))
+        
+        user_posts = self.tracker.get_user_posts_by_topic(user_id)
+        
+        if topic_id in user_posts:
+            message_ids = user_posts[topic_id].copy()
+            
+            # Удаляем сообщения из группы
+            deleted_count = 0
+            for message_id in message_ids:
+                try:
+                    await self.application.bot.delete_message(
+                        chat_id=self.target_group_id,
+                        message_id=message_id
+                    )
+                    self.tracker.remove_post(user_id, topic_id, message_id)
+                    deleted_count += 1
+                except Exception as e:
+                    logger.error(f"Ошибка удаления сообщения {message_id}: {e}")
+            
+            topics = self.tracker.get_topics()
+            topic_name = topics.get(topic_id, f"Тема {topic_id}")
+            
+            await query.edit_message_text(
+                text=f"✅ Удалено {deleted_count} объявлений из темы '{topic_name}'\n\n"
+                     f"Теперь вы можете создать новые объявления!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📝 Создать объявление", callback_data="create_another")],
+                    [InlineKeyboardButton("📊 Мои объявления", callback_data="my_posts")]
+                ])
+            )
+        else:
+            await query.edit_message_text(
+                text="❌ Объявления в этой теме не найдены.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="my_posts")]])
+            )
+        
+        return CATEGORY_SELECTION
+    
+    async def cancel_conversation(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Отмена разговора"""
+        await update.message.reply_text(
+            "Создание объявления отменено. Для начала используйте /start"
+        )
+        return ConversationHandler.END
         """Обработчик новых участников чата"""
         if not update.chat_member or not update.effective_chat:
             return
@@ -532,40 +980,53 @@ async def main():
     # Получаем токен из переменных окружения
     TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
     RENDER_URL = os.getenv('RENDER_URL', 'https://your-app.onrender.com')
+    TARGET_GROUP_ID = os.getenv('TARGET_GROUP_ID')  # ID группы куда отправлять объявления
     PORT = int(os.getenv('PORT', 8000))
     
     if not TOKEN:
         logger.error("❌ Не указан TELEGRAM_BOT_TOKEN в переменных окружения!")
         return
     
+    if not TARGET_GROUP_ID:
+        logger.warning("⚠️ TARGET_GROUP_ID не указан - объявления не будут отправляться в группу")
+    
     # Создаем бота
-    bot = TelegramLimitBot(TOKEN, RENDER_URL)
+    bot = TelegramLimitBot(TOKEN, RENDER_URL, TARGET_GROUP_ID)
     
     try:
         # Создаем приложение
         bot.application = Application.builder().token(TOKEN).build()
         
+        # Создаем ConversationHandler для работы с объявлениями
+        conversation_handler = ConversationHandler(
+            entry_points=[CommandHandler("start", bot.start_conversation)],
+            states={
+                LANGUAGE_SELECTION: [CallbackQueryHandler(bot.language_selection)],
+                CATEGORY_SELECTION: [CallbackQueryHandler(bot.category_selection)],
+                WRITING_POST: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, bot.process_user_post),
+                    CallbackQueryHandler(bot.category_selection, pattern="back_to_categories")
+                ],
+                DELETE_SELECTION: [CallbackQueryHandler(bot.handle_topic_deletion)]
+            },
+            fallbacks=[
+                CommandHandler("cancel", bot.cancel_conversation),
+                CallbackQueryHandler(bot.handle_callbacks, pattern="^(create_another|my_posts|start_delete|back_to_lang)$")
+            ],
+            per_user=True,
+            per_chat=False
+        )
+        
         # Добавляем обработчики
-        bot.application.add_handler(CommandHandler("start", bot.start_command))
-        bot.application.add_handler(CommandHandler("status", bot.status_command))
+        bot.application.add_handler(conversation_handler)
         
-        # Обработчик новых участников
-        bot.application.add_handler(ChatMemberHandler(bot.handle_new_member, ChatMemberHandler.CHAT_MEMBER))
+        # Обработчики для работы в группе (опционально)
+        if TARGET_GROUP_ID:
+            bot.application.add_handler(ChatMemberHandler(bot.handle_new_member, ChatMemberHandler.CHAT_MEMBER))
+            bot.application.add_handler(CallbackQueryHandler(bot.handle_accept_rules, pattern="accept_rules_"))
         
-        # Обработчик кнопок
-        bot.application.add_handler(CallbackQueryHandler(bot.handle_accept_rules, pattern="accept_rules_"))
-        
-        # Обработчики сообщений
-        bot.application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message)
-        )
-        bot.application.add_handler(
-            MessageHandler(
-                filters.PHOTO | filters.VIDEO | filters.Document.ALL | 
-                filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE | filters.Sticker.ALL, 
-                bot.handle_message
-            )
-        )
+        # Глобальный обработчик callback-ов
+        bot.application.add_handler(CallbackQueryHandler(bot.handle_callbacks))
         
         # Обработчик ошибок
         bot.application.add_error_handler(bot.error_handler)
@@ -587,7 +1048,7 @@ async def main():
         await bot.application.bot.set_webhook(
             url=webhook_url,
             drop_pending_updates=True,
-            allowed_updates=['message', 'edited_message', 'channel_post', 'edited_channel_post', 'chat_member', 'callback_query']
+            allowed_updates=['message', 'edited_message', 'callback_query', 'chat_member']
         )
         
         logger.info(f"🔗 Webhook установлен: {webhook_url}")
