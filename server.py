@@ -294,7 +294,9 @@ def main():
     # Set webhook and start the bot
     logger.info("Setting webhook and starting bot")
     import asyncio
-    asyncio.run(set_webhook())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(set_webhook())
     application.run_webhook(
         listen="0.0.0.0",
         port=10000,
