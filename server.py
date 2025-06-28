@@ -28,7 +28,7 @@ CATEGORY, GENDER, LOCATION, DATE, ANNOUNCEMENT = range(5)
 import os
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # Add your chat ID here
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 # Function to ping the bot to prevent Render from idling
 def ping_self():
@@ -53,6 +53,7 @@ Thread(target=run_scheduler, daemon=True).start()
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Initiate the conversation, ask for category selection."""
     chat_id = update.effective_chat.id
+    logger.info(f"Received /start command from chat_id: {chat_id}")
     try:
         # Simulate forum topics (replace with actual API call if available)
         topics = [
@@ -215,6 +216,8 @@ async def announcement_received(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Post to the selected topic in the chat
     try:
+        if not CHAT_ID:
+            raise ValueError("CHAT_ID is not set")
         message = await context.bot.send_message(
             chat_id=CHAT_ID,
             text=formatted_message,
@@ -231,6 +234,7 @@ async def announcement_received(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"Error posting announcement: {e}")
         await update.message.reply_text("Error posting announcement. Try again.")
+        return ConversationHandler.END
 
     # Clear user data
     context.user_data.clear()
@@ -251,9 +255,13 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Run the bot."""
+    if not BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN is not set")
+        raise ValueError("TELEGRAM_BOT_TOKEN is not set")
+
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Conversation handler with per_message=True to address warning
+    # Conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -267,7 +275,6 @@ def main():
             ANNOUNCEMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, announcement_received)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=True
     )
 
     # Add handlers
@@ -275,6 +282,7 @@ def main():
     application.add_error_handler(error_handler)
 
     # Start the bot
+    logger.info("Starting bot polling")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
