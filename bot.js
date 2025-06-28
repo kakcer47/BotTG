@@ -9,12 +9,12 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 // Хранилище пользовательских настроек
 const userSettings = new Map();
 
-// Список доступных тем (message_thread_id)
+// Список доступных тем (замените на реальные ID из вашей группы)
 const TOPICS = {
-    '1': 'Общий',
-    '2': 'Разработка', 
-    '3': 'Дизайн',
-    '4': 'Маркетинг'
+    '27': 'Тема 1',  // Замените на ваши реальные ID и названия
+    '28': 'Тема 2',  // Получите из ссылок тем
+    '29': 'Тема 3',
+    '30': 'Тема 4'
 };
 
 // Команда старт
@@ -54,6 +54,45 @@ bot.on('callback_query', async (query) => {
 // Команда для получения chat ID (для настройки)
 bot.onText(/\/id/, async (msg) => {
     await bot.sendMessage(msg.chat.id, `Chat ID: ${msg.chat.id}`);
+});
+
+// Команда для получения списка тем группы
+bot.onText(/\/topics/, async (msg) => {
+    const chatId = msg.chat.id;
+    try {
+        // Попробуем отправить тестовое сообщение без thread_id чтобы проверить доступ
+        await bot.sendMessage(GROUP_ID, 'Тест доступа к группе');
+        await bot.sendMessage(chatId, `Группа ID: ${GROUP_ID}\nДля получения ID тем:\n1. Откройте каждую тему в группе\n2. Скопируйте ссылку\n3. Последнее число в ссылке = ID темы\n\nПример: t.me/c/xxx/27 → ID темы: 27`);
+    } catch (error) {
+        await bot.sendMessage(chatId, `Ошибка доступа к группе: ${error.message}`);
+    }
+});
+
+// Команда быстрой настройки тем
+bot.onText(/\/setup (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const topicsInput = match[1];
+    
+    try {
+        // Формат: /setup 27:Общий,28:Разработка,29:Дизайн
+        const topics = {};
+        topicsInput.split(',').forEach(item => {
+            const [id, name] = item.split(':');
+            if (id && name) {
+                topics[id.trim()] = name.trim();
+            }
+        });
+        
+        if (Object.keys(topics).length > 0) {
+            // Сохраняем настройки (в реальном проекте лучше в БД)
+            Object.assign(TOPICS, topics);
+            await bot.sendMessage(chatId, `Настроены темы:\n${Object.entries(topics).map(([id, name]) => `${id}: ${name}`).join('\n')}`);
+        } else {
+            await bot.sendMessage(chatId, 'Неверный формат. Используйте: /setup ID:Название,ID:Название');
+        }
+    } catch (error) {
+        await bot.sendMessage(chatId, 'Ошибка настройки тем');
+    }
 });
 
 // Пересылка сообщений
@@ -105,7 +144,15 @@ bot.on('message', async (msg) => {
         
     } catch (error) {
         console.error('Ошибка пересылки:', error);
-        await bot.sendMessage(chatId, 'Ошибка отправки');
+        
+        let errorMsg = 'Ошибка отправки';
+        if (error.message.includes('message thread not found')) {
+            errorMsg = `Тема не найдена. Используйте /topics для настройки или /setup для быстрой настройки`;
+        } else if (error.message.includes('chat not found')) {
+            errorMsg = 'Группа не найдена. Проверьте GROUP_ID';
+        }
+        
+        await bot.sendMessage(chatId, errorMsg);
     }
 });
 
