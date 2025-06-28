@@ -13,7 +13,6 @@ from telegram.ext import (
     ContextTypes,
 )
 from threading import Thread
-from uuid import uuid4
 
 # Logging setup for debugging
 logging.basicConfig(
@@ -49,7 +48,8 @@ def run_scheduler():
         time.sleep(60)
 
 # Start scheduler in background
-Thread(target=run_scheduler, daemon=True).start()
+scheduler_thread = Thread(target=run_scheduler, daemon=True)
+scheduler_thread.start()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Initiate the conversation, ask for category selection."""
@@ -68,17 +68,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(topic["name"], callback_data=f"category_{topic['name']}_{topic['thread_id']}")]
             for topic in topics
         ]
-        keyboard.append([InlineKeyboardButton("Back", callback_data="back_start")])
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await update.message.reply_text(
-            "In which category would you like to create an announcement?",
+            "В какой категории вы хотите создать объявление?",
             reply_markup=reply_markup
         )
         return CATEGORY
     except Exception as e:
         logger.error(f"Error fetching topics: {e}")
-        await update.message.reply_text("Error fetching categories. Try again.")
+        await update.message.reply_text("Ошибка получения категорий. Попробуйте снова.")
         return ConversationHandler.END
 
 async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -87,24 +86,19 @@ async def category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data == "back_start":
-        await query.message.delete()
-        return await start(update, context)
-
     # Store selected category
     context.user_data["category"] = data.split("_")[1]
     context.user_data["category_id"] = data.split("_")[2]
 
     keyboard = [
-        [InlineKeyboardButton("Male", callback_data="gender_male")],
-        [InlineKeyboardButton("Female", callback_data="gender_female")],
-        [InlineKeyboardButton("Back", callback_data="back_category")]
+        [InlineKeyboardButton("Мужской", callback_data="gender_male")],
+        [InlineKeyboardButton("Женский", callback_data="gender_female")],
+        [InlineKeyboardButton("Назад", callback_data="back_to_start")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.message.delete()
-    await query.message.reply_text(
-        "Your gender:",
+    await query.edit_message_text(
+        "Ваш пол:",
         reply_markup=reply_markup
     )
     return GENDER
@@ -115,90 +109,73 @@ async def gender_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
-    if data == "back_category":
-        await query.message.delete()
-        return await start(update, context)
+    if data == "back_to_start":
+        return await restart_conversation(update, context)
 
     # Store selected gender
-    context.user_data["gender"] = "Male" if data == "gender_male" else "Female"
+    context.user_data["gender"] = "Мужской" if data == "gender_male" else "Женский"
 
-    keyboard = [[InlineKeyboardButton("Back", callback_data="back_gender")]]
+    keyboard = [[InlineKeyboardButton("Назад", callback_data="back_to_category")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await query.message.delete()
-    await query.message.reply_text(
-        "Write where the meeting will take place:",
+    await query.edit_message_text(
+        "Напишите, где будет проходить встреча:",
         reply_markup=reply_markup
     )
     return LOCATION
 
 async def location_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle location input, ask for date."""
-    if update.message.text == "Back":
-        await update.message.delete()
-        return await gender_selected(update, context)
-
     # Store location
     context.user_data["location"] = update.message.text
 
     keyboard = [
-        [InlineKeyboardButton("Skip", callback_data="date_skip")],
-        [InlineKeyboardButton("Back", callback_data="back_location")]
+        [InlineKeyboardButton("Пропустить", callback_data="date_skip")],
+        [InlineKeyboardButton("Назад", callback_data="back_to_gender")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.delete()
     await update.message.reply_text(
-        "Date of the meeting, example: 06.05-10.05 (from-to), or exact date, or skip:",
+        "Дата встречи, например: 06.05-10.05 (с-по), или точная дата, или пропустить:",
         reply_markup=reply_markup
     )
     return DATE
 
-async def date_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle date input or skip, ask for announcement text."""
-    query = update.callback_query
-    if query:
+async def date_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle date input or callback."""
+    if update.callback_query:
+        query = update.callback_query
         await query.answer()
         data = query.data
 
-        if data == "back_location":
-            await query.message.delete()
-            return await gender_selected(update, context)
+        if data == "back_to_gender":
+            return await go_back_to_gender(update, context)
         elif data == "date_skip":
             context.user_data["date"] = ""
-            await query.message.delete()
-            keyboard = [[InlineKeyboardButton("Back", callback_data="back_date")]]
+            
+            keyboard = [[InlineKeyboardButton("Назад", callback_data="back_to_date")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await query.message.reply_text(
-                "Write your announcement, example: Looking for a friend for philosophical discussions on deep topics.",
+            
+            await query.edit_message_text(
+                "Напишите ваше объявление, например: Ищу друга для философских дискуссий на глубокие темы.",
                 reply_markup=reply_markup
             )
             return ANNOUNCEMENT
     else:
-        # Validate date format (basic check)
-        date_text = update.message.text
-        if date_text == "Back":
-            await update.message.delete()
-            return await gender_selected(update, context)
-        # Allow any format for simplicity
-        context.user_data["date"] = date_text
+        # Handle text message for date
+        context.user_data["date"] = update.message.text
 
-        keyboard = [[InlineKeyboardButton("Back", callback_data="back_date")]]
+        keyboard = [[InlineKeyboardButton("Назад", callback_data="back_to_date")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await update.message.delete()
         await update.message.reply_text(
-            "Write your announcement, example: Looking for a friend for philosophical discussions on deep topics.",
+            "Напишите ваше объявление, например: Ищу друга для философских дискуссий на глубокие темы.",
             reply_markup=reply_markup
         )
         return ANNOUNCEMENT
 
 async def announcement_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle announcement text, post to chat, and send confirmation."""
-    if update.message.text == "Back":
-        await update.message.delete()
-        return await date_selected(update, context)
-
     # Store announcement
     context.user_data["announcement"] = update.message.text
 
@@ -210,15 +187,18 @@ async def announcement_received(update: Update, context: ContextTypes.DEFAULT_TY
     category_id = context.user_data["category_id"]
 
     # Create formatted message
-    header = f"{gender}. {location}. {date}".strip()
-    if header.endswith("."):
-        header = header[:-1]  # Remove trailing dot if date is empty
+    header_parts = [gender, location]
+    if date:
+        header_parts.append(date)
+    
+    header = ". ".join(header_parts)
     formatted_message = f">{header}\n{announcement}"
 
     # Post to the selected topic in the chat
     try:
         if not CHAT_ID:
             raise ValueError("CHAT_ID is not set")
+        
         message = await context.bot.send_message(
             chat_id=CHAT_ID,
             text=formatted_message,
@@ -226,42 +206,84 @@ async def announcement_received(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
         # Generate a link to the message
-        message_link = f"https://t.me/c/{str(CHAT_ID).replace('-100', '')}/{message.message_id}"
+        chat_id_clean = str(CHAT_ID).replace('-100', '')
+        message_link = f"https://t.me/c/{chat_id_clean}/{message.message_id}"
 
         # Notify user of successful posting
         await update.message.reply_text(
-            f"Announcement posted successfully: {message_link}"
+            f"Объявление успешно опубликовано: {message_link}"
         )
     except Exception as e:
         logger.error(f"Error posting announcement: {e}")
-        await update.message.reply_text("Error posting announcement. Try again.")
-        return ConversationHandler.END
+        await update.message.reply_text("Ошибка при публикации объявления. Попробуйте снова.")
 
     # Clear user data
     context.user_data.clear()
     return ConversationHandler.END
 
+async def handle_back_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle back button presses in announcement state."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "back_to_date":
+        return await go_back_to_date(update, context)
+
+# Helper functions for navigation
+async def restart_conversation(update, context):
+    """Restart conversation from beginning."""
+    context.user_data.clear()
+    return await start(update, context)
+
+async def go_back_to_gender(update, context):
+    """Go back to gender selection."""
+    query = update.callback_query
+    
+    keyboard = [
+        [InlineKeyboardButton("Мужской", callback_data="gender_male")],
+        [InlineKeyboardButton("Женский", callback_data="gender_female")],
+        [InlineKeyboardButton("Назад", callback_data="back_to_start")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        "Ваш пол:",
+        reply_markup=reply_markup
+    )
+    return GENDER
+
+async def go_back_to_date(update, context):
+    """Go back to date selection."""
+    query = update.callback_query
+    
+    keyboard = [
+        [InlineKeyboardButton("Пропустить", callback_data="date_skip")],
+        [InlineKeyboardButton("Назад", callback_data="back_to_gender")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        "Дата встречи, например: 06.05-10.05 (с-по), или точная дата, или пропустить:",
+        reply_markup=reply_markup
+    )
+    return DATE
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the conversation."""
-    await update.message.reply_text("Operation cancelled.")
+    await update.message.reply_text("Операция отменена.")
     context.user_data.clear()
     return ConversationHandler.END
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors during conversation."""
     logger.error(f"Update {update} caused error {context.error}")
-    if update and update.message:
-        await update.message.reply_text("An error occurred. Please try again.")
-    else:
-        logger.warning("No update.message available, skipping reply")
+    if update and update.effective_message:
+        try:
+            await update.effective_message.reply_text("Произошла ошибка. Пожалуйста, попробуйте снова.")
+        except Exception as e:
+            logger.error(f"Failed to send error message: {e}")
     return ConversationHandler.END
-
-async def set_webhook():
-    """Set the webhook for the bot."""
-    webhook_url = f"{RENDER_URL}{WEBHOOK_PATH}"
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}"
-    response = requests.get(url)
-    logger.info(f"Set webhook response: {response.json()}")
 
 def main():
     """Run the bot."""
@@ -271,37 +293,46 @@ def main():
 
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Conversation handler
+    # Conversation handler with per_message=True to avoid warnings
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             CATEGORY: [CallbackQueryHandler(category_selected)],
             GENDER: [CallbackQueryHandler(gender_selected)],
-            LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, location_received)],
-            DATE: [
-                CallbackQueryHandler(date_selected),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, date_selected)
+            LOCATION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, location_received),
+                CallbackQueryHandler(gender_selected)  # Handle back button
             ],
-            ANNOUNCEMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, announcement_received)],
+            DATE: [
+                CallbackQueryHandler(date_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, date_handler)
+            ],
+            ANNOUNCEMENT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, announcement_received),
+                CallbackQueryHandler(handle_back_buttons)
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=True,  # This fixes the warning
     )
 
     # Add handlers
     application.add_handler(conv_handler)
     application.add_error_handler(error_handler)
 
-    # Set webhook and start the bot
-    logger.info("Setting webhook and starting bot")
-    import asyncio
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(set_webhook())
+    # Start the bot
+    logger.info("Starting bot with webhooks")
+    
+    # Set webhook
+    webhook_url = f"{RENDER_URL}{WEBHOOK_PATH}"
+    
+    # Use run_webhook method properly
     application.run_webhook(
         listen="0.0.0.0",
-        port=10000,
+        port=int(os.environ.get("PORT", 10000)),
         url_path=WEBHOOK_PATH,
-        webhook_url=f"{RENDER_URL}{WEBHOOK_PATH}"
+        webhook_url=webhook_url,
+        secret_token=os.environ.get("WEBHOOK_SECRET_TOKEN")  # Optional but recommended
     )
 
 if __name__ == "__main__":
