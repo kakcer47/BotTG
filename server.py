@@ -2,12 +2,12 @@ import os
 import asyncio
 import logging
 import psycopg
-import aiohttp
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
-from aiohttp import web
 import json
 
 # Настройка логирования
@@ -34,122 +34,153 @@ class Database:
     
     def init_db(self):
         """Инициализация базы данных"""
-        with psycopg.connect(self.database_url) as conn:
-            with conn.cursor() as cur:
-                # Таблица пользователей с лимитами
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        user_id BIGINT PRIMARY KEY,
-                        language VARCHAR(10) DEFAULT 'ru',
-                        ads_count INTEGER DEFAULT 0,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-                
-                # Таблица объявлений
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS ads (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT NOT NULL,
-                        message_id INTEGER NOT NULL,
-                        topic_id INTEGER NOT NULL,
-                        topic_name VARCHAR(255) NOT NULL,
-                        complaints INTEGER DEFAULT 0,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (user_id) REFERENCES users(user_id)
-                    )
-                """)
-                
-                # Индексы для оптимизации
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_ads_user_id ON ads(user_id)")
-                cur.execute("CREATE INDEX IF NOT EXISTS idx_ads_message_id ON ads(message_id)")
-                
-            conn.commit()
+        try:
+            with psycopg.connect(self.database_url) as conn:
+                with conn.cursor() as cur:
+                    # Таблица пользователей с лимитами
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS users (
+                            user_id BIGINT PRIMARY KEY,
+                            language VARCHAR(10) DEFAULT 'ru',
+                            ads_count INTEGER DEFAULT 0,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    
+                    # Таблица объявлений
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS ads (
+                            id SERIAL PRIMARY KEY,
+                            user_id BIGINT NOT NULL,
+                            message_id INTEGER NOT NULL,
+                            topic_id INTEGER NOT NULL,
+                            topic_name VARCHAR(255) NOT NULL,
+                            complaints INTEGER DEFAULT 0,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (user_id) REFERENCES users(user_id)
+                        )
+                    """)
+                    
+                    # Индексы для оптимизации
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_ads_user_id ON ads(user_id)")
+                    cur.execute("CREATE INDEX IF NOT EXISTS idx_ads_message_id ON ads(message_id)")
+                    
+                conn.commit()
+                logger.info("Database initialized successfully")
+        except Exception as e:
+            logger.error(f"Database initialization failed: {e}")
+            # Бот может работать без БД (ограниченно)
     
     def get_user(self, user_id):
         """Получить данные пользователя"""
-        with psycopg.connect(self.database_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
-                return cur.fetchone()
+        try:
+            with psycopg.connect(self.database_url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
+                    return cur.fetchone()
+        except Exception as e:
+            logger.error(f"Database error in get_user: {e}")
+            return None
     
     def create_or_update_user(self, user_id, language='ru'):
         """Создать или обновить пользователя"""
-        with psycopg.connect(self.database_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO users (user_id, language) 
-                    VALUES (%s, %s) 
-                    ON CONFLICT (user_id) 
-                    DO UPDATE SET language = EXCLUDED.language
-                """, (user_id, language))
-            conn.commit()
+        try:
+            with psycopg.connect(self.database_url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO users (user_id, language) 
+                        VALUES (%s, %s) 
+                        ON CONFLICT (user_id) 
+                        DO UPDATE SET language = EXCLUDED.language
+                    """, (user_id, language))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Database error in create_or_update_user: {e}")
     
     def get_user_ads(self, user_id):
         """Получить объявления пользователя"""
-        with psycopg.connect(self.database_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT id, message_id, topic_id, topic_name, created_at 
-                    FROM ads WHERE user_id = %s ORDER BY created_at DESC
-                """, (user_id,))
-                return cur.fetchall()
+        try:
+            with psycopg.connect(self.database_url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT id, message_id, topic_id, topic_name, created_at 
+                        FROM ads WHERE user_id = %s ORDER BY created_at DESC
+                    """, (user_id,))
+                    return cur.fetchall()
+        except Exception as e:
+            logger.error(f"Database error in get_user_ads: {e}")
+            return []
     
     def add_ad(self, user_id, message_id, topic_id, topic_name):
         """Добавить объявление"""
-        with psycopg.connect(self.database_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO ads (user_id, message_id, topic_id, topic_name) 
-                    VALUES (%s, %s, %s, %s)
-                """, (user_id, message_id, topic_id, topic_name))
-                
-                cur.execute("""
-                    UPDATE users SET ads_count = ads_count + 1 
-                    WHERE user_id = %s
-                """, (user_id,))
-            conn.commit()
+        try:
+            with psycopg.connect(self.database_url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO ads (user_id, message_id, topic_id, topic_name) 
+                        VALUES (%s, %s, %s, %s)
+                    """, (user_id, message_id, topic_id, topic_name))
+                    
+                    cur.execute("""
+                        UPDATE users SET ads_count = ads_count + 1 
+                        WHERE user_id = %s
+                    """, (user_id,))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Database error in add_ad: {e}")
     
     def delete_ad(self, ad_id, user_id):
         """Удалить объявление"""
-        with psycopg.connect(self.database_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM ads WHERE id = %s AND user_id = %s", (ad_id, user_id))
-                deleted = cur.rowcount > 0
-                if deleted:
-                    cur.execute("""
-                        UPDATE users SET ads_count = ads_count - 1 
-                        WHERE user_id = %s AND ads_count > 0
-                    """, (user_id,))
-            conn.commit()
-            return deleted
+        try:
+            with psycopg.connect(self.database_url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM ads WHERE id = %s AND user_id = %s", (ad_id, user_id))
+                    deleted = cur.rowcount > 0
+                    if deleted:
+                        cur.execute("""
+                            UPDATE users SET ads_count = ads_count - 1 
+                            WHERE user_id = %s AND ads_count > 0
+                        """, (user_id,))
+                conn.commit()
+                return deleted
+        except Exception as e:
+            logger.error(f"Database error in delete_ad: {e}")
+            return False
     
     def add_complaint(self, message_id):
         """Добавить жалобу к объявлению"""
-        with psycopg.connect(self.database_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE ads SET complaints = complaints + 1 
-                    WHERE message_id = %s RETURNING complaints, user_id, topic_name
-                """, (message_id,))
-                result = cur.fetchone()
-            conn.commit()
-            return result
+        try:
+            with psycopg.connect(self.database_url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        UPDATE ads SET complaints = complaints + 1 
+                        WHERE message_id = %s RETURNING complaints, user_id, topic_name
+                    """, (message_id,))
+                    result = cur.fetchone()
+                conn.commit()
+                return result
+        except Exception as e:
+            logger.error(f"Database error in add_complaint: {e}")
+            return None
     
     def delete_ad_by_message_id(self, message_id):
         """Удалить объявление по message_id"""
-        with psycopg.connect(self.database_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT user_id FROM ads WHERE message_id = %s", (message_id,))
-                user_data = cur.fetchone()
-                if user_data:
-                    cur.execute("DELETE FROM ads WHERE message_id = %s", (message_id,))
-                    cur.execute("""
-                        UPDATE users SET ads_count = ads_count - 1 
-                        WHERE user_id = %s AND ads_count > 0
-                    """, (user_data[0],))
-            conn.commit()
-            return user_data[0] if user_data else None
+        try:
+            with psycopg.connect(self.database_url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT user_id FROM ads WHERE message_id = %s", (message_id,))
+                    user_data = cur.fetchone()
+                    if user_data:
+                        cur.execute("DELETE FROM ads WHERE message_id = %s", (message_id,))
+                        cur.execute("""
+                            UPDATE users SET ads_count = ads_count - 1 
+                            WHERE user_id = %s AND ads_count > 0
+                        """, (user_data[0],))
+                conn.commit()
+                return user_data[0] if user_data else None
+        except Exception as e:
+            logger.error(f"Database error in delete_ad_by_message_id: {e}")
+            return None
 
 class TelegramBot:
     def __init__(self):
@@ -423,9 +454,21 @@ class TelegramBot:
     async def self_ping(self, context: ContextTypes.DEFAULT_TYPE):
         """Самопинг для предотвращения засыпания"""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(WEBHOOK_URL) as response:
-                    logger.info(f"Self-ping status: {response.status}")
+            def ping_sync():
+                try:
+                    with urllib.request.urlopen(f"{WEBHOOK_URL}/", timeout=10) as response:
+                        return response.status
+                except Exception as e:
+                    logger.error(f"Self-ping error: {e}")
+                    return None
+            
+            # Выполняем синхронный запрос в отдельном потоке
+            import concurrent.futures
+            loop = asyncio.get_event_loop()
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                status = await loop.run_in_executor(executor, ping_sync)
+                if status:
+                    logger.info(f"Self-ping successful: {status}")
         except Exception as e:
             logger.error(f"Self-ping error: {e}")
     
@@ -439,10 +482,6 @@ class TelegramBot:
         job_queue = self.app.job_queue
         job_queue.run_repeating(self.self_ping, interval=1500, first=10)
     
-    async def health_check(self, request):
-        """Health check endpoint для Render"""
-        return web.Response(text="OK", status=200)
-    
     async def run_webhook(self):
         """Запуск с webhook для Render"""
         await self.app.initialize()
@@ -452,17 +491,12 @@ class TelegramBot:
         webhook_url = f"{WEBHOOK_URL}/webhook"
         await self.app.bot.set_webhook(webhook_url)
         
-        # Создание дополнительных маршрутов
-        async def setup_routes(application):
-            application.router.add_get('/health', self.health_check)
-        
         # Запуск webhook сервера
         await self.app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             webhook_url=webhook_url,
-            drop_pending_updates=True,
-            webhook_app_setup=setup_routes
+            drop_pending_updates=True
         )
     
     async def run_polling(self):
