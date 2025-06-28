@@ -1,14 +1,13 @@
 {
-  "name": "telegram-moderator-bot",
+  "name": "moderator-bot",
   "version": "1.0.0",
-  "description": "Hidden moderator bot with message counting and restrictions",
-  "main": "bot-moderator.js",
+  "description": "Hidden moderator bot with database",
+  "main": "moderator-bot.js",
   "scripts": {
-    "start": "node bot-moderator.js"
+    "start": "node moderator-bot.js"
   },
   "dependencies": {
     "node-telegram-bot-api": "^0.66.0",
-    "express": "^4.18.2",
     "pg": "^8.11.3"
   },
   "engines": {
