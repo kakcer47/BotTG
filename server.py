@@ -358,7 +358,11 @@ async def main():
             MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message)
         )
         bot.application.add_handler(
-            MessageHandler(filters.PHOTO | filters.VIDEO | filters.DOCUMENT, bot.handle_message)
+            MessageHandler(
+                filters.PHOTO | filters.VIDEO | filters.Document.ALL | 
+                filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE | filters.STICKER, 
+                bot.handle_message
+            )
         )
         
         # Обработчик ошибок
