@@ -54,16 +54,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Initiate the conversation, ask for category selection."""
     chat_id = update.effective_chat.id
     try:
-        # Fetch forum topics from the chat
-        # Note: getForumTopics is not directly available in python-telegram-bot v20.7
-        # We'll simulate topics or use a predefined list for now
-        # Replace with actual API call when available or use Telegram Bot API directly
+        # Simulate forum topics (replace with actual API call if available)
         topics = [
             {"name": "General", "thread_id": "1"},
             {"name": "Philosophy", "thread_id": "2"},
             {"name": "Meetups", "thread_id": "3"},
             {"name": "Discussions", "thread_id": "4"},
-        ]  # Replace with actual topic fetching if possible
+        ]
 
         keyboard = [
             [InlineKeyboardButton(topic["name"], callback_data=f"category_{topic['name']}_{topic['thread_id']}")]
@@ -123,7 +120,7 @@ async def gender_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Store selected gender
     context.user_data["gender"] = "Male" if data == "gender_male" else "Female"
 
-    keyboard = [[InlineKeyboardButton("Back Ascending"Back", callback_data="back_gender")]]
+    keyboard = [[InlineKeyboardButton("Back", callback_data="back_gender")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await query.message.delete()
@@ -270,7 +267,7 @@ def main():
             ANNOUNCEMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, announcement_received)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=True  # Address the PTBUserWarning
+        per_message=True
     )
 
     # Add handlers
