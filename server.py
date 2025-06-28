@@ -310,16 +310,33 @@ class TelegramLimitBot:
             except:
                 pass
 
-# Функция для веб-сервера (keep-alive endpoint)
-async def create_web_server():
-    """Создает простой веб-сервер для keep-alive"""
+# Функция для веб-сервера (keep-alive + webhook endpoint)
+async def create_web_server(bot_application):
+    """Создает веб-сервер с webhook endpoint"""
     
     async def health_check(request):
         return web.Response(text="Bot is alive!", status=200)
     
+    async def webhook_handler(request):
+        """Обработчик webhook от Telegram"""
+        try:
+            # Получаем JSON данные от Telegram
+            json_data = await request.json()
+            
+            # Создаем Update объект и обрабатываем его
+            update = Update.de_json(json_data, bot_application.bot)
+            if update:
+                await bot_application.process_update(update)
+            
+            return web.Response(status=200)
+        except Exception as e:
+            logger.error(f"Ошибка в webhook: {e}")
+            return web.Response(status=500)
+    
     app = web.Application()
     app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
+    app.router.add_post('/webhook', webhook_handler)  # Webhook endpoint
     
     return app
 
@@ -337,16 +354,6 @@ async def main():
     # Создаем бота
     bot = TelegramLimitBot(TOKEN, RENDER_URL)
     
-    # Запускаем веб-сервер для keep-alive
-    web_app = await create_web_server()
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    
-    logger.info(f"🌐 Веб-сервер запущен на порту {PORT}")
-    
-    # Запускаем бота
     try:
         # Создаем приложение
         bot.application = Application.builder().token(TOKEN).build()
@@ -360,7 +367,7 @@ async def main():
         bot.application.add_handler(
             MessageHandler(
                 filters.PHOTO | filters.VIDEO | filters.Document.ALL | 
-                filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE | filters.STICKER, 
+                filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE | filters.Sticker.ALL, 
                 bot.handle_message
             )
         )
@@ -368,17 +375,37 @@ async def main():
         # Обработчик ошибок
         bot.application.add_error_handler(bot.error_handler)
         
-        # Запускаем keep-alive в фоне
-        bot.keep_alive_task = asyncio.create_task(bot.keep_alive())
+        # Инициализируем приложение
+        await bot.application.initialize()
         
-        logger.info("🚀 Запуск бота...")
-        logger.info("✅ Бот успешно запущен!")
+        # Создаем веб-сервер с webhook
+        web_app = await create_web_server(bot.application)
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', PORT)
+        await site.start()
         
-        # Запускаем бота (блокирующий вызов)
-        await bot.application.run_polling(
+        logger.info(f"🌐 Веб-сервер запущен на порту {PORT}")
+        
+        # Настраиваем webhook URL
+        webhook_url = f"{RENDER_URL}/webhook"
+        await bot.application.bot.set_webhook(
+            url=webhook_url,
             drop_pending_updates=True,
             allowed_updates=['message', 'edited_message', 'channel_post', 'edited_channel_post']
         )
+        
+        logger.info(f"🔗 Webhook установлен: {webhook_url}")
+        
+        # Запускаем keep-alive в фоне
+        bot.keep_alive_task = asyncio.create_task(bot.keep_alive())
+        
+        logger.info("🚀 Бот успешно запущен с webhook!")
+        logger.info("✅ Ожидание обновлений через webhook...")
+        
+        # Бесконечный цикл для поддержания работы сервера
+        while True:
+            await asyncio.sleep(3600)  # Спим час, веб-сервер работает в фоне
         
     except KeyboardInterrupt:
         logger.info("🛑 Остановка бота...")
@@ -387,9 +414,21 @@ async def main():
         import traceback
         logger.error(traceback.format_exc())
     finally:
+        try:
+            # Удаляем webhook при завершении
+            if bot.application:
+                await bot.application.bot.delete_webhook()
+                await bot.application.shutdown()
+        except:
+            pass
+        
         if bot.keep_alive_task:
             bot.keep_alive_task.cancel()
-        await runner.cleanup()
+        
+        try:
+            await runner.cleanup()
+        except:
+            pass
 
 if __name__ == '__main__':
     asyncio.run(main())
