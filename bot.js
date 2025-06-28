@@ -21,6 +21,7 @@ const app = express();
 const userSettings = new Map();
 const messageComplaints = new Map();
 const messageCache = new Map();
+const groupSettings = new Map(); // Настройки групп
 
 // Список тем
 const TOPICS = {
@@ -46,14 +47,27 @@ if (WEBHOOK_URL) {
 }
 
 app.get('/', (req, res) => {
+    const settings = groupSettings.get(GROUP_ID) || { interceptEnabled: true };
+    
     res.send(`
         <h1>Telegram Bot Status</h1>
         <p>✅ Бот работает</p>
         <p>🆔 Group ID: ${GROUP_ID}</p>
         <p>🤖 Bot Token: ${BOT_TOKEN ? 'установлен' : 'НЕ УСТАНОВЛЕН'}</p>
         <p>🌐 Webhook: ${WEBHOOK_URL ? 'установлен' : 'polling режим'}</p>
+        <p>🔄 Режим перехвата: ${settings.interceptEnabled ? 'включен ✅' : 'выключен ❌'}</p>
         <p>📊 Сообщений в кеше: ${messageCache.size}</p>
         <p>⚙️ Настроек пользователей: ${userSettings.size}</p>
+        <p>🔢 Жалоб активных: ${messageComplaints.size}</p>
+        
+        <h2>Команды для тестирования:</h2>
+        <ul>
+            <li><code>/test</code> - проверка кнопок</li>
+            <li><code>/info</code> - информация о чате</li>
+            <li><code>/intercept on</code> - включить перехват (только админы)</li>
+            <li><code>/intercept off</code> - выключить перехват (только админы)</li>
+            <li><code>/help</code> - справка по командам</li>
+        </ul>
     `);
 });
 
@@ -117,6 +131,84 @@ bot.onText(/\/start/, async (msg) => {
     });
 });
 
+// Управление режимом перехвата сообщений
+bot.onText(/\/intercept (on|off)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    
+    if (chatId.toString() !== GROUP_ID) {
+        await bot.sendMessage(chatId, '❌ Команда работает только в настроенной группе');
+        return;
+    }
+    
+    // Проверяем права администратора
+    try {
+        const member = await bot.getChatMember(chatId, msg.from.id);
+        if (!['creator', 'administrator'].includes(member.status)) {
+            await bot.sendMessage(chatId, '❌ Только администраторы могут управлять режимом');
+            return;
+        }
+    } catch (error) {
+        console.error('[ADMIN CHECK ERROR]', error);
+        return;
+    }
+    
+    const action = match[1];
+    const settings = groupSettings.get(chatId) || {};
+    settings.interceptEnabled = (action === 'on');
+    groupSettings.set(chatId, settings);
+    
+    await bot.sendMessage(chatId, `✅ Режим перехвата сообщений ${action === 'on' ? 'включен' : 'выключен'}`);
+    console.log(`[INTERCEPT] Режим ${action} для группы ${chatId}`);
+});
+
+// Помощь по командам
+bot.onText(/\/help/, async (msg) => {
+    const chatId = msg.chat.id;
+    const isGroup = chatId.toString() === GROUP_ID;
+    
+    let helpText = `🤖 Команды бота:
+
+📋 Общие команды:
+• /start - настройка тем для пересылки
+• /setup ID:Название,ID:Название - быстрая настройка тем
+• /test - проверка работы кнопок
+• /info - информация о чате и правах бота
+• /help - эта справка`;
+
+    if (isGroup) {
+        helpText += `
+
+🔧 Команды для группы (только админы):
+• /intercept on/off - включить/выключить перехват сообщений
+• /intercept_status - статус режима перехвата
+
+📝 Как работает перехват:
+1. Любое сообщение в группе → бот удаляет оригинал
+2. Создает новое от своего имени с кнопками
+3. Кнопки: Пожаловаться, Удалить, Поделиться, Автор`;
+    } else {
+        helpText += `
+
+💬 Пересылка в темы:
+1. Используйте /start для выбора темы
+2. Все сообщения будут пересылаться в выбранную тему группы`;
+    }
+    
+    await bot.sendMessage(chatId, helpText);
+});
+
+// Статус режима перехвата
+bot.onText(/\/intercept_status/, async (msg) => {
+    const chatId = msg.chat.id;
+    
+    if (chatId.toString() !== GROUP_ID) return;
+    
+    const settings = groupSettings.get(chatId) || { interceptEnabled: true };
+    const status = settings.interceptEnabled ? 'включен ✅' : 'выключен ❌';
+    
+    await bot.sendMessage(chatId, `📊 Режим перехвата сообщений: ${status}`);
+});
+
 // Настройка тем
 bot.onText(/\/setup (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
@@ -169,6 +261,7 @@ bot.on('callback_query', async (query) => {
     }
     else if (data.startsWith('complain_')) {
         const messageId = data.replace('complain_', '');
+        const cached = messageCache.get(messageId);
         
         if (!messageComplaints.has(messageId)) {
             messageComplaints.set(messageId, new Set());
@@ -184,9 +277,33 @@ bot.on('callback_query', async (query) => {
         complaints.add(userId);
         await bot.answerCallbackQuery(query.id, { text: `⚠️ Жалоба принята (${complaints.size}/5)` });
         
+        // Обновляем кнопку с счетчиком
+        if (complaints.size < 5) {
+            const newKeyboard = {
+                inline_keyboard: [[
+                    { text: `Пожаловаться (${complaints.size}/5)`, callback_data: `complain_${messageId}` },
+                    { text: 'Удалить для себя', callback_data: `delete_${messageId}` }
+                ], [
+                    { text: 'Поделиться', callback_data: `share_${messageId}` },
+                    { text: 'Автор', callback_data: `author_${messageId}` }
+                ]]
+            };
+            
+            try {
+                await bot.editMessageReplyMarkup(newKeyboard, {
+                    chat_id: chatId,
+                    message_id: query.message.message_id
+                });
+            } catch (error) {
+                console.error('[EDIT KEYBOARD ERROR]', error);
+            }
+        }
+        
         if (complaints.size >= 5) {
             try {
                 await bot.deleteMessage(chatId, messageId);
+                messageComplaints.delete(messageId);
+                messageCache.delete(messageId);
                 console.log(`[DELETE] Сообщение ${messageId} удалено по жалобам`);
             } catch (error) {
                 console.error('[DELETE ERROR]', error);
@@ -195,8 +312,12 @@ bot.on('callback_query', async (query) => {
     }
     else if (data.startsWith('share_')) {
         const messageId = data.replace('share_', '');
+        const cached = messageCache.get(messageId);
+        
+        // Используем originalMessageId если есть, иначе сам messageId
+        const linkMessageId = cached?.originalMessageId || messageId;
         const groupIdNum = GROUP_ID.replace('-100', '');
-        const messageLink = `https://t.me/c/${groupIdNum}/${messageId}`;
+        const messageLink = `https://t.me/c/${groupIdNum}/${linkMessageId}`;
         
         try {
             await bot.sendMessage(userId, `🔗 Ссылка на сообщение:\n${messageLink}`);
@@ -246,22 +367,22 @@ bot.on('message', async (msg) => {
     
     console.log(`[MESSAGE] От ${msg.from.first_name} в чате ${chatId}: ${msg.text || 'медиа'}`);
     
-    // Обработка сообщений в целевой группе
+    // Обработка сообщений в целевой группе - ПЕРЕХВАТ И ПЕРЕСЫЛКА ОТ БОТА
     if (chatId.toString() === GROUP_ID) {
-        console.log('[GROUP] Сообщение в целевой группе');
+        const settings = groupSettings.get(chatId) || { interceptEnabled: true };
+        
+        if (!settings.interceptEnabled) {
+            console.log('[GROUP] Режим перехвата выключен');
+            return;
+        }
+        
+        console.log('[GROUP] Перехватываем и пересылаем от бота');
         
         try {
-            // Сохраняем в кеш
-            messageCache.set(messageId, {
-                author: {
-                    id: msg.from.id,
-                    username: msg.from.username,
-                    first_name: msg.from.first_name,
-                    last_name: msg.from.last_name
-                },
-                content: msg.text || 'медиа',
-                timestamp: Date.now()
-            });
+            // Информация об авторе
+            let authorName = msg.from.first_name || 'Пользователь';
+            if (msg.from.last_name) authorName += ` ${msg.from.last_name}`;
+            if (msg.from.username) authorName += ` (@${msg.from.username})`;
             
             // Создаем кнопки
             const keyboard = {
@@ -274,19 +395,107 @@ bot.on('message', async (msg) => {
                 ]]
             };
             
-            // Информация об авторе
-            let authorName = msg.from.first_name || 'Пользователь';
-            if (msg.from.last_name) authorName += ` ${msg.from.last_name}`;
-            if (msg.from.username) authorName += ` (@${msg.from.username})`;
+            let botMessage;
             
-            // Отправляем панель управления
-            await bot.sendMessage(GROUP_ID, `🔧 Управление сообщением от ${authorName}:`, {
-                reply_to_message_id: messageId,
-                reply_markup: keyboard,
-                disable_notification: true
-            });
+            // Отправляем сообщение от бота в зависимости от типа
+            if (msg.text) {
+                botMessage = await bot.sendMessage(GROUP_ID, `${authorName}:\n\n${msg.text}`, {
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.photo) {
+                botMessage = await bot.sendPhoto(GROUP_ID, msg.photo[msg.photo.length - 1].file_id, {
+                    caption: `${authorName}:\n\n${msg.caption || ''}`,
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.document) {
+                botMessage = await bot.sendDocument(GROUP_ID, msg.document.file_id, {
+                    caption: `${authorName}:\n\n${msg.caption || ''}`,
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.video) {
+                botMessage = await bot.sendVideo(GROUP_ID, msg.video.file_id, {
+                    caption: `${authorName}:\n\n${msg.caption || ''}`,
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.voice) {
+                // Для голосовых отправляем голосовое + сообщение с кнопками
+                await bot.sendVoice(GROUP_ID, msg.voice.file_id);
+                botMessage = await bot.sendMessage(GROUP_ID, `↑ Голосовое от ${authorName}`, {
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.sticker) {
+                // Для стикеров отправляем стикер + сообщение с кнопками
+                await bot.sendSticker(GROUP_ID, msg.sticker.file_id);
+                botMessage = await bot.sendMessage(GROUP_ID, `↑ Стикер от ${authorName}`, {
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.audio) {
+                botMessage = await bot.sendAudio(GROUP_ID, msg.audio.file_id, {
+                    caption: `${authorName}:\n\n${msg.caption || ''}`,
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.video_note) {
+                // Для видео-заметок (кружочков)
+                await bot.sendVideoNote(GROUP_ID, msg.video_note.file_id);
+                botMessage = await bot.sendMessage(GROUP_ID, `↑ Видео-заметка от ${authorName}`, {
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else {
+                // Для неизвестных типов
+                botMessage = await bot.sendMessage(GROUP_ID, `${authorName} отправил медиа`, {
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            }
             
-            console.log('[BUTTONS] Кнопки добавлены к сообщению');
+            if (botMessage) {
+                // Сохраняем информацию о сообщении от бота
+                messageCache.set(botMessage.message_id, {
+                    author: {
+                        id: msg.from.id,
+                        username: msg.from.username,
+                        first_name: msg.from.first_name,
+                        last_name: msg.from.last_name
+                    },
+                    content: msg.text || msg.caption || 'медиа',
+                    timestamp: Date.now(),
+                    originalMessageId: messageId
+                });
+                
+                // Обновляем callback_data для кнопок с новым ID сообщения от бота
+                const newKeyboard = {
+                    inline_keyboard: [[
+                        { text: 'Пожаловаться', callback_data: `complain_${botMessage.message_id}` },
+                        { text: 'Удалить для себя', callback_data: `delete_${botMessage.message_id}` }
+                    ], [
+                        { text: 'Поделиться', callback_data: `share_${botMessage.message_id}` },
+                        { text: 'Автор', callback_data: `author_${botMessage.message_id}` }
+                    ]]
+                };
+                
+                await bot.editMessageReplyMarkup(newKeyboard, {
+                    chat_id: GROUP_ID,
+                    message_id: botMessage.message_id
+                });
+                
+                console.log(`[SUCCESS] Сообщение от бота создано с ID: ${botMessage.message_id}`);
+            }
+            
+            // Удаляем оригинальное сообщение пользователя
+            try {
+                await bot.deleteMessage(GROUP_ID, messageId);
+                console.log(`[DELETE] Оригинальное сообщение ${messageId} удалено`);
+            } catch (error) {
+                console.error('[DELETE ERROR] Не удалось удалить оригинал:', error.message);
+            }
             
         } catch (error) {
             console.error('[GROUP ERROR]', error);
@@ -357,6 +566,21 @@ bot.on('message', async (msg) => {
         await bot.sendMessage(chatId, errorMsg);
     }
 });
+
+// Очистка кеша каждые 30 минут
+setInterval(() => {
+    const now = Date.now();
+    const oneHour = 60 * 60 * 1000;
+    
+    for (const [messageId, data] of messageCache.entries()) {
+        if (now - data.timestamp > oneHour) {
+            messageCache.delete(messageId);
+            messageComplaints.delete(messageId);
+        }
+    }
+    
+    console.log(`[CACHE] Очистка завершена. Сообщений в кеше: ${messageCache.size}`);
+}, 30 * 60 * 1000);
 
 // Обработка ошибок
 bot.on('error', (error) => {
