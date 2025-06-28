@@ -192,13 +192,19 @@ bot.on('callback_query', async (query) => {
     
     // Обработка кнопок модерации
     else if (data.startsWith('complain_')) {
-        const originalMessageId = data.replace('complain_', '');
+        const botMessageId = data.replace('complain_', '');
+        const cachedMessage = messageCache.get(botMessageId);
         
-        if (!messageComplaints.has(originalMessageId)) {
-            messageComplaints.set(originalMessageId, new Set());
+        if (!cachedMessage) {
+            await bot.answerCallbackQuery(query.id, { text: 'Сообщение не найдено в кеше' });
+            return;
         }
         
-        const complaints = messageComplaints.get(originalMessageId);
+        if (!messageComplaints.has(botMessageId)) {
+            messageComplaints.set(botMessageId, new Set());
+        }
+        
+        const complaints = messageComplaints.get(botMessageId);
         
         if (complaints.has(userId)) {
             await bot.answerCallbackQuery(query.id, { text: 'Вы уже пожаловались на это сообщение' });
@@ -209,13 +215,11 @@ bot.on('callback_query', async (query) => {
         
         if (complaints.size >= 5) {
             try {
-                await bot.deleteMessage(GROUP_ID, originalMessageId);
-                await bot.editMessageText('Сообщение удалено по жалобам', {
-                    chat_id: chatId,
-                    message_id: messageId
-                });
-                messageComplaints.delete(originalMessageId);
-                messageCache.delete(originalMessageId);
+                // Удаляем сообщение от бота (которое содержит контент пользователя)
+                await bot.deleteMessage(GROUP_ID, botMessageId);
+                messageComplaints.delete(botMessageId);
+                messageCache.delete(botMessageId);
+                await bot.answerCallbackQuery(query.id, { text: 'Сообщение удалено по жалобам' });
             } catch (error) {
                 await bot.answerCallbackQuery(query.id, { text: 'Не удалось удалить сообщение' });
             }
@@ -225,11 +229,11 @@ bot.on('callback_query', async (query) => {
             // Обновляем кнопки с новым счетчиком
             const keyboard = {
                 inline_keyboard: [[
-                    { text: `Пожаловаться (${complaints.size}/5)`, callback_data: `complain_${originalMessageId}` },
-                    { text: 'Удалить для себя', callback_data: `delete_${originalMessageId}` }
+                    { text: `Пожаловаться (${complaints.size}/5)`, callback_data: `complain_${botMessageId}` },
+                    { text: 'Удалить для себя', callback_data: `delete_${botMessageId}` }
                 ], [
-                    { text: 'Переслать', callback_data: `forward_${originalMessageId}` },
-                    { text: 'Написать автору', callback_data: `write_${originalMessageId}` }
+                    { text: 'Переслать', callback_data: `forward_${botMessageId}` },
+                    { text: 'Написать автору', callback_data: `write_${botMessageId}` }
                 ]]
             };
             
@@ -244,17 +248,25 @@ bot.on('callback_query', async (query) => {
     
     else if (data.startsWith('delete_')) {
         try {
+            // Удаляем сообщение от бота (с кнопками)
             await bot.deleteMessage(chatId, messageId);
-            await bot.answerCallbackQuery(query.id, { text: 'Панель управления скрыта' });
+            await bot.answerCallbackQuery(query.id, { text: 'Сообщение скрыто для вас' });
         } catch (error) {
-            await bot.answerCallbackQuery(query.id, { text: 'Не удалось скрыть панель' });
+            await bot.answerCallbackQuery(query.id, { text: 'Не удалось скрыть сообщение' });
         }
     }
     
     else if (data.startsWith('forward_')) {
-        const originalMessageId = data.replace('forward_', '');
+        const botMessageId = data.replace('forward_', '');
+        const cachedMessage = messageCache.get(botMessageId);
+        
+        if (!cachedMessage || !cachedMessage.originalMessageId) {
+            await bot.answerCallbackQuery(query.id, { text: 'Ссылка недоступна' });
+            return;
+        }
+        
         const groupIdNum = GROUP_ID.replace('-100', '');
-        const messageLink = `https://t.me/c/${groupIdNum}/${originalMessageId}`;
+        const messageLink = `https://t.me/c/${groupIdNum}/${cachedMessage.originalMessageId}`;
         
         try {
             await bot.sendMessage(userId, `Ссылка на сообщение:\n${messageLink}`);
@@ -265,8 +277,8 @@ bot.on('callback_query', async (query) => {
     }
     
     else if (data.startsWith('write_')) {
-        const originalMessageId = data.replace('write_', '');
-        const cachedMessage = messageCache.get(originalMessageId);
+        const botMessageId = data.replace('write_', '');
+        const cachedMessage = messageCache.get(botMessageId);
         
         if (!cachedMessage) {
             await bot.answerCallbackQuery(query.id, { text: 'Информация об авторе не найдена' });
@@ -293,14 +305,15 @@ bot.on('callback_query', async (query) => {
 
 // Пересылка сообщений и панель управления
 bot.on('message', async (msg) => {
-    // Панель управления для сообщений в группе
+    // Перехват и пересылка сообщений в группе от имени бота
     if (msg.chat.id.toString() === GROUP_ID && !msg.from.is_bot && !msg.text?.startsWith('/')) {
         const settings = groupSettings.get(msg.chat.id) || { buttonsEnabled: true };
         
         if (settings.buttonsEnabled) {
             try {
-                // Сохраняем сообщение в кеш
-                messageCache.set(msg.message_id, {
+                // Сохраняем оригинальное сообщение в кеш
+                const originalMessageId = msg.message_id;
+                messageCache.set(originalMessageId, {
                     author: {
                         id: msg.from.id,
                         username: msg.from.username,
@@ -314,11 +327,11 @@ bot.on('message', async (msg) => {
                 // Создаем панель управления
                 const keyboard = {
                     inline_keyboard: [[
-                        { text: 'Пожаловаться', callback_data: `complain_${msg.message_id}` },
-                        { text: 'Удалить для себя', callback_data: `delete_${msg.message_id}` }
+                        { text: 'Пожаловаться', callback_data: `complain_${originalMessageId}` },
+                        { text: 'Удалить для себя', callback_data: `delete_${originalMessageId}` }
                     ], [
-                        { text: 'Переслать', callback_data: `forward_${msg.message_id}` },
-                        { text: 'Написать автору', callback_data: `write_${msg.message_id}` }
+                        { text: 'Переслать', callback_data: `forward_${originalMessageId}` },
+                        { text: 'Написать автору', callback_data: `write_${originalMessageId}` }
                     ]]
                 };
                 
@@ -328,22 +341,103 @@ bot.on('message', async (msg) => {
                     authorName += ` ${msg.from.last_name}`;
                 }
                 if (msg.from.username) {
-                    authorName += ` (@${msg.from.username})`;
+                    authorName = `${authorName} (@${msg.from.username})`;
                 }
                 
-                await bot.sendMessage(GROUP_ID, `Управление сообщением от ${authorName}:`, {
-                    reply_to_message_id: msg.message_id,
-                    reply_markup: keyboard,
-                    disable_notification: true
-                });
+                let sentMessage;
+                
+                // Пересылаем сообщение от имени бота в зависимости от типа
+                if (msg.text) {
+                    sentMessage = await bot.sendMessage(GROUP_ID, `${authorName}:\n\n${msg.text}`, {
+                        reply_markup: keyboard,
+                        parse_mode: 'HTML'
+                    });
+                } else if (msg.photo) {
+                    sentMessage = await bot.sendPhoto(GROUP_ID, msg.photo[msg.photo.length - 1].file_id, {
+                        caption: `${authorName}:\n\n${msg.caption || ''}`,
+                        reply_markup: keyboard,
+                        parse_mode: 'HTML'
+                    });
+                } else if (msg.document) {
+                    sentMessage = await bot.sendDocument(GROUP_ID, msg.document.file_id, {
+                        caption: `${authorName}:\n\n${msg.caption || ''}`,
+                        reply_markup: keyboard,
+                        parse_mode: 'HTML'
+                    });
+                } else if (msg.video) {
+                    sentMessage = await bot.sendVideo(GROUP_ID, msg.video.file_id, {
+                        caption: `${authorName}:\n\n${msg.caption || ''}`,
+                        reply_markup: keyboard,
+                        parse_mode: 'HTML'
+                    });
+                } else if (msg.voice) {
+                    sentMessage = await bot.sendVoice(GROUP_ID, msg.voice.file_id, {
+                        caption: `${authorName}:`,
+                        reply_markup: keyboard,
+                        parse_mode: 'HTML'
+                    });
+                } else if (msg.sticker) {
+                    // Для стикеров отправляем отдельное сообщение с информацией об авторе
+                    await bot.sendSticker(GROUP_ID, msg.sticker.file_id);
+                    sentMessage = await bot.sendMessage(GROUP_ID, `${authorName} отправил стикер`, {
+                        reply_markup: keyboard,
+                        parse_mode: 'HTML'
+                    });
+                } else {
+                    // Для других типов медиа
+                    sentMessage = await bot.sendMessage(GROUP_ID, `${authorName} отправил медиа`, {
+                        reply_markup: keyboard,
+                        parse_mode: 'HTML'
+                    });
+                }
+                
+                // Обновляем кеш с новым ID сообщения от бота
+                if (sentMessage) {
+                    messageCache.delete(originalMessageId);
+                    messageCache.set(sentMessage.message_id, {
+                        author: {
+                            id: msg.from.id,
+                            username: msg.from.username,
+                            first_name: msg.from.first_name,
+                            last_name: msg.from.last_name
+                        },
+                        content: msg.text || msg.caption || 'Медиа',
+                        timestamp: Date.now(),
+                        originalMessageId: originalMessageId
+                    });
+                    
+                    // Обновляем callback data на новый message_id
+                    const newKeyboard = {
+                        inline_keyboard: [[
+                            { text: 'Пожаловаться', callback_data: `complain_${sentMessage.message_id}` },
+                            { text: 'Удалить для себя', callback_data: `delete_${sentMessage.message_id}` }
+                        ], [
+                            { text: 'Переслать', callback_data: `forward_${sentMessage.message_id}` },
+                            { text: 'Написать автору', callback_data: `write_${sentMessage.message_id}` }
+                        ]]
+                    };
+                    
+                    await bot.editMessageReplyMarkup(newKeyboard, {
+                        chat_id: GROUP_ID,
+                        message_id: sentMessage.message_id
+                    });
+                }
+                
+                // Удаляем оригинальное сообщение пользователя
+                try {
+                    await bot.deleteMessage(GROUP_ID, originalMessageId);
+                } catch (error) {
+                    console.error('Не удалось удалить оригинальное сообщение:', error);
+                }
+                
             } catch (error) {
-                console.error('Ошибка создания панели управления:', error);
+                console.error('Ошибка пересылки сообщения от бота:', error);
             }
         }
         return;
     }
     
-    // Игнорировать команды и сообщения из целевой группы для пересылки
+    // Игнорировать команды и сообщения из целевой группы для пересылки в темы
     if (msg.text?.startsWith('/') || msg.chat.id.toString() === GROUP_ID) return;
     
     const chatId = msg.chat.id;
@@ -359,7 +453,7 @@ bot.on('message', async (msg) => {
             message_thread_id: parseInt(userConfig.topicId)
         };
         
-        // Пересылка разных типов сообщений
+        // Пересылка разных типов сообщений в темы
         if (msg.text) {
             await bot.sendMessage(GROUP_ID, msg.text, messageOptions);
         } else if (msg.photo) {
