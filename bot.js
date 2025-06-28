@@ -49,23 +49,40 @@ if (WEBHOOK_URL) {
 app.get('/', (req, res) => {
     const settings = groupSettings.get(GROUP_ID) || { interceptEnabled: true };
     
+    // Подсчет пользователей по режимам
+    let topicUsers = 0;
+    let groupUsers = 0;
+    for (const [chatId, config] of userSettings.entries()) {
+        if (config.mode === 'topic') topicUsers++;
+        else if (config.mode === 'group') groupUsers++;
+    }
+    
     res.send(`
         <h1>Telegram Bot Status</h1>
         <p>✅ Бот работает</p>
         <p>🆔 Group ID: ${GROUP_ID}</p>
         <p>🤖 Bot Token: ${BOT_TOKEN ? 'установлен' : 'НЕ УСТАНОВЛЕН'}</p>
         <p>🌐 Webhook: ${WEBHOOK_URL ? 'установлен' : 'polling режим'}</p>
-        <p>🔄 Режим перехвата: ${settings.interceptEnabled ? 'включен ✅' : 'выключен ❌'}</p>
+        <p>🔄 Режим перехвата в группе: ${settings.interceptEnabled ? 'включен ✅' : 'выключен ❌'}</p>
         <p>📊 Сообщений в кеше: ${messageCache.size}</p>
-        <p>⚙️ Настроек пользователей: ${userSettings.size}</p>
+        <p>⚙️ Всего пользователей: ${userSettings.size}</p>
+        <p>📁 Режим "темы": ${topicUsers} пользователей</p>
+        <p>💬 Режим "основной чат": ${groupUsers} пользователей</p>
         <p>🔢 Жалоб активных: ${messageComplaints.size}</p>
+        
+        <h2>Режимы работы:</h2>
+        <ul>
+            <li><strong>В группе:</strong> Перехват сообщений + кнопки модерации</li>
+            <li><strong>Личный чат → темы:</strong> Обычная пересылка в выбранную тему</li>
+            <li><strong>Личный чат → группа:</strong> Отправка от бота с кнопками</li>
+        </ul>
         
         <h2>Команды для тестирования:</h2>
         <ul>
             <li><code>/test</code> - проверка кнопок</li>
             <li><code>/info</code> - информация о чате</li>
+            <li><code>/start</code> - выбор режима отправки</li>
             <li><code>/intercept on</code> - включить перехват (только админы)</li>
-            <li><code>/intercept off</code> - выключить перехват (только админы)</li>
             <li><code>/help</code> - справка по командам</li>
         </ul>
     `);
@@ -120,13 +137,19 @@ bot.onText(/\/start/, async (msg) => {
     console.log(`[START] Пользователь ${msg.from.first_name} запустил бота`);
     
     const keyboard = {
-        inline_keyboard: Object.entries(TOPICS).map(([id, name]) => [{
-            text: name,
-            callback_data: `topic_${id}`
-        }])
+        inline_keyboard: [
+            ...Object.entries(TOPICS).map(([id, name]) => [{
+                text: `📁 ${name}`,
+                callback_data: `topic_${id}`
+            }]),
+            [{
+                text: '💬 Отправлять в основной чат группы',
+                callback_data: 'mode_group'
+            }]
+        ]
     };
     
-    await bot.sendMessage(chatId, '🎯 Выберите тему для отправки сообщений:', { 
+    await bot.sendMessage(chatId, '🎯 Выберите куда отправлять сообщения:', { 
         reply_markup: keyboard 
     });
 });
@@ -169,7 +192,8 @@ bot.onText(/\/help/, async (msg) => {
     let helpText = `🤖 Команды бота:
 
 📋 Общие команды:
-• /start - настройка тем для пересылки
+• /start - выбор режима отправки сообщений
+• /mode - переключение режима (только в личных чатах)
 • /setup ID:Название,ID:Название - быстрая настройка тем
 • /test - проверка работы кнопок
 • /info - информация о чате и правах бота
@@ -189,12 +213,56 @@ bot.onText(/\/help/, async (msg) => {
     } else {
         helpText += `
 
-💬 Пересылка в темы:
-1. Используйте /start для выбора темы
-2. Все сообщения будут пересылаться в выбранную тему группы`;
+💬 Режимы отправки из личного чата:
+1. 📁 В темы группы - обычная пересылка в выбранную тему
+2. 💬 В основной чат группы - отправка от имени бота с кнопками
+
+🚀 Как пользоваться:
+1. Используйте /start для выбора режима
+2. Отправляйте сообщения боту
+3. Они появятся в группе в выбранном формате`;
     }
     
     await bot.sendMessage(chatId, helpText);
+});
+
+// Команда для переключения режима отправки
+bot.onText(/\/mode/, async (msg) => {
+    const chatId = msg.chat.id;
+    
+    // Только в личных чатах
+    if (chatId.toString() === GROUP_ID) {
+        await bot.sendMessage(chatId, '❌ Эта команда работает только в личных сообщениях с ботом');
+        return;
+    }
+    
+    const currentConfig = userSettings.get(chatId);
+    let currentMode = 'не настроен';
+    
+    if (currentConfig) {
+        if (currentConfig.mode === 'topic') {
+            currentMode = `📁 Тема: ${currentConfig.topicName}`;
+        } else if (currentConfig.mode === 'group') {
+            currentMode = '💬 Основной чат группы';
+        }
+    }
+    
+    const keyboard = {
+        inline_keyboard: [
+            ...Object.entries(TOPICS).map(([id, name]) => [{
+                text: `📁 ${name}`,
+                callback_data: `topic_${id}`
+            }]),
+            [{
+                text: '💬 Основной чат группы',
+                callback_data: 'mode_group'
+            }]
+        ]
+    };
+    
+    await bot.sendMessage(chatId, `🔄 Текущий режим: ${currentMode}\n\nВыберите новый режим:`, { 
+        reply_markup: keyboard 
+    });
 });
 
 // Статус режима перехвата
@@ -247,9 +315,25 @@ bot.on('callback_query', async (query) => {
         const topicId = data.replace('topic_', '');
         const topicName = TOPICS[topicId];
         
-        userSettings.set(chatId, { topicId, topicName });
+        userSettings.set(chatId, { 
+            mode: 'topic',
+            topicId, 
+            topicName 
+        });
         
-        await bot.editMessageText(`✅ Выбрана тема: ${topicName}\n\nТеперь ваши сообщения будут отправляться в эту тему.`, {
+        await bot.editMessageText(`✅ Выбрана тема: ${topicName}\n\nВаши сообщения будут отправляться в эту тему группы.`, {
+            chat_id: chatId,
+            message_id: query.message.message_id
+        });
+        
+        await bot.answerCallbackQuery(query.id);
+    }
+    else if (data === 'mode_group') {
+        userSettings.set(chatId, { 
+            mode: 'group'
+        });
+        
+        await bot.editMessageText(`✅ Режим: отправка в основной чат группы\n\nВаши сообщения будут отправляться в группу от имени бота с кнопками модерации.`, {
             chat_id: chatId,
             message_id: query.message.message_id
         });
@@ -314,16 +398,29 @@ bot.on('callback_query', async (query) => {
         const messageId = data.replace('share_', '');
         const cached = messageCache.get(messageId);
         
-        // Используем originalMessageId если есть, иначе сам messageId
-        const linkMessageId = cached?.originalMessageId || messageId;
-        const groupIdNum = GROUP_ID.replace('-100', '');
-        const messageLink = `https://t.me/c/${groupIdNum}/${linkMessageId}`;
-        
-        try {
-            await bot.sendMessage(userId, `🔗 Ссылка на сообщение:\n${messageLink}`);
-            await bot.answerCallbackQuery(query.id, { text: '✅ Ссылка отправлена в личку' });
-        } catch (error) {
-            await bot.answerCallbackQuery(query.id, { text: '❌ Сначала напишите боту в личку' });
+        if (cached && cached.fromPrivate) {
+            // Для сообщений из приватных чатов отправляем ссылку на сообщение от бота
+            const groupIdNum = GROUP_ID.replace('-100', '');
+            const messageLink = `https://t.me/c/${groupIdNum}/${messageId}`;
+            
+            try {
+                await bot.sendMessage(userId, `🔗 Ссылка на сообщение в группе:\n${messageLink}`);
+                await bot.answerCallbackQuery(query.id, { text: '✅ Ссылка отправлена в личку' });
+            } catch (error) {
+                await bot.answerCallbackQuery(query.id, { text: '❌ Сначала напишите боту в личку' });
+            }
+        } else {
+            // Для сообщений из группы используем originalMessageId если есть
+            const linkMessageId = cached?.originalMessageId || messageId;
+            const groupIdNum = GROUP_ID.replace('-100', '');
+            const messageLink = `https://t.me/c/${groupIdNum}/${linkMessageId}`;
+            
+            try {
+                await bot.sendMessage(userId, `🔗 Ссылка на сообщение:\n${messageLink}`);
+                await bot.answerCallbackQuery(query.id, { text: '✅ Ссылка отправлена в личку' });
+            } catch (error) {
+                await bot.answerCallbackQuery(query.id, { text: '❌ Сначала напишите боту в личку' });
+            }
         }
     }
     else if (data.startsWith('author_')) {
@@ -504,66 +601,196 @@ bot.on('message', async (msg) => {
         return;
     }
     
-    // Пересылка сообщений в темы (из личных чатов)
+    // Пересылка сообщений из личных чатов
     const userConfig = userSettings.get(chatId);
     
     if (!userConfig) {
-        await bot.sendMessage(chatId, '❌ Используйте /start для настройки темы');
+        await bot.sendMessage(chatId, '❌ Используйте /start для настройки режима отправки');
         return;
     }
     
-    try {
-        const messageOptions = {
-            message_thread_id: parseInt(userConfig.topicId)
-        };
+    if (userConfig.mode === 'group') {
+        // Отправка в основной чат группы с кнопками (как от пользователя в группе)
+        console.log(`[PRIVATE-TO-GROUP] Отправка от ${msg.from.first_name} в основной чат группы`);
         
-        console.log(`[FORWARD] Пересылка в тему ${userConfig.topicId}`);
-        
-        // Пересылка в зависимости от типа сообщения
-        if (msg.text) {
-            await bot.sendMessage(GROUP_ID, msg.text, messageOptions);
-        } else if (msg.photo) {
-            await bot.sendPhoto(GROUP_ID, msg.photo[msg.photo.length - 1].file_id, {
-                ...messageOptions,
-                caption: msg.caption || ''
+        try {
+            // Информация об авторе
+            let authorName = msg.from.first_name || 'Пользователь';
+            if (msg.from.last_name) authorName += ` ${msg.from.last_name}`;
+            if (msg.from.username) authorName += ` (@${msg.from.username})`;
+            
+            // Создаем временный ID для кнопок (используем timestamp + user id)
+            const tempMessageId = `${Date.now()}_${msg.from.id}`;
+            
+            // Создаем кнопки
+            const keyboard = {
+                inline_keyboard: [[
+                    { text: 'Пожаловаться', callback_data: `complain_${tempMessageId}` },
+                    { text: 'Удалить для себя', callback_data: `delete_${tempMessageId}` }
+                ], [
+                    { text: 'Поделиться', callback_data: `share_${tempMessageId}` },
+                    { text: 'Автор', callback_data: `author_${tempMessageId}` }
+                ]]
+            };
+            
+            let botMessage;
+            
+            // Отправляем сообщение в группу от бота в зависимости от типа
+            if (msg.text) {
+                botMessage = await bot.sendMessage(GROUP_ID, `${authorName}:\n\n${msg.text}`, {
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.photo) {
+                botMessage = await bot.sendPhoto(GROUP_ID, msg.photo[msg.photo.length - 1].file_id, {
+                    caption: `${authorName}:\n\n${msg.caption || ''}`,
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.document) {
+                botMessage = await bot.sendDocument(GROUP_ID, msg.document.file_id, {
+                    caption: `${authorName}:\n\n${msg.caption || ''}`,
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.video) {
+                botMessage = await bot.sendVideo(GROUP_ID, msg.video.file_id, {
+                    caption: `${authorName}:\n\n${msg.caption || ''}`,
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.voice) {
+                await bot.sendVoice(GROUP_ID, msg.voice.file_id);
+                botMessage = await bot.sendMessage(GROUP_ID, `↑ Голосовое от ${authorName}`, {
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.sticker) {
+                await bot.sendSticker(GROUP_ID, msg.sticker.file_id);
+                botMessage = await bot.sendMessage(GROUP_ID, `↑ Стикер от ${authorName}`, {
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.audio) {
+                botMessage = await bot.sendAudio(GROUP_ID, msg.audio.file_id, {
+                    caption: `${authorName}:\n\n${msg.caption || ''}`,
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else if (msg.video_note) {
+                await bot.sendVideoNote(GROUP_ID, msg.video_note.file_id);
+                botMessage = await bot.sendMessage(GROUP_ID, `↑ Видео-заметка от ${authorName}`, {
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            } else {
+                botMessage = await bot.sendMessage(GROUP_ID, `${authorName} отправил медиа`, {
+                    reply_markup: keyboard,
+                    parse_mode: 'HTML'
+                });
+            }
+            
+            if (botMessage) {
+                // Сохраняем информацию о сообщении от бота
+                messageCache.set(botMessage.message_id, {
+                    author: {
+                        id: msg.from.id,
+                        username: msg.from.username,
+                        first_name: msg.from.first_name,
+                        last_name: msg.from.last_name
+                    },
+                    content: msg.text || msg.caption || 'медиа',
+                    timestamp: Date.now(),
+                    fromPrivate: true // Отмечаем что сообщение из приватного чата
+                });
+                
+                // Обновляем callback_data для кнопок с реальным ID сообщения от бота
+                const newKeyboard = {
+                    inline_keyboard: [[
+                        { text: 'Пожаловаться', callback_data: `complain_${botMessage.message_id}` },
+                        { text: 'Удалить для себя', callback_data: `delete_${botMessage.message_id}` }
+                    ], [
+                        { text: 'Поделиться', callback_data: `share_${botMessage.message_id}` },
+                        { text: 'Автор', callback_data: `author_${botMessage.message_id}` }
+                    ]]
+                };
+                
+                await bot.editMessageReplyMarkup(newKeyboard, {
+                    chat_id: GROUP_ID,
+                    message_id: botMessage.message_id
+                });
+                
+                console.log(`[PRIVATE-TO-GROUP] Сообщение отправлено в группу с ID: ${botMessage.message_id}`);
+            }
+            
+            // Подтверждение отправки
+            await bot.sendMessage(chatId, '✅ Отправлено в группу', { 
+                reply_to_message_id: messageId 
             });
-        } else if (msg.document) {
-            await bot.sendDocument(GROUP_ID, msg.document.file_id, {
-                ...messageOptions,
-                caption: msg.caption || ''
-            });
-        } else if (msg.video) {
-            await bot.sendVideo(GROUP_ID, msg.video.file_id, {
-                ...messageOptions,
-                caption: msg.caption || ''
-            });
-        } else if (msg.voice) {
-            await bot.sendVoice(GROUP_ID, msg.voice.file_id, messageOptions);
-        } else if (msg.sticker) {
-            await bot.sendSticker(GROUP_ID, msg.sticker.file_id, messageOptions);
-        } else if (msg.audio) {
-            await bot.sendAudio(GROUP_ID, msg.audio.file_id, {
-                ...messageOptions,
-                caption: msg.caption || ''
-            });
+            
+        } catch (error) {
+            console.error('[PRIVATE-TO-GROUP ERROR]', error);
+            await bot.sendMessage(chatId, '❌ Ошибка отправки в группу');
         }
         
-        // Подтверждение
-        await bot.sendMessage(chatId, '✅ Отправлено', { 
-            reply_to_message_id: messageId 
-        });
-        
-        console.log('[FORWARD] Успешно переслано');
-        
-    } catch (error) {
-        console.error('[FORWARD ERROR]', error);
-        
-        let errorMsg = '❌ Ошибка отправки';
-        if (error.message.includes('thread not found')) {
-            errorMsg = '❌ Тема не найдена. Используйте /setup для настройки';
+        return;
+    }
+    
+    // Режим отправки в темы (старая логика)
+    if (userConfig.mode === 'topic') {
+        try {
+            const messageOptions = {
+                message_thread_id: parseInt(userConfig.topicId)
+            };
+            
+            console.log(`[FORWARD] Пересылка в тему ${userConfig.topicId}`);
+            
+            // Пересылка в зависимости от типа сообщения
+            if (msg.text) {
+                await bot.sendMessage(GROUP_ID, msg.text, messageOptions);
+            } else if (msg.photo) {
+                await bot.sendPhoto(GROUP_ID, msg.photo[msg.photo.length - 1].file_id, {
+                    ...messageOptions,
+                    caption: msg.caption || ''
+                });
+            } else if (msg.document) {
+                await bot.sendDocument(GROUP_ID, msg.document.file_id, {
+                    ...messageOptions,
+                    caption: msg.caption || ''
+                });
+            } else if (msg.video) {
+                await bot.sendVideo(GROUP_ID, msg.video.file_id, {
+                    ...messageOptions,
+                    caption: msg.caption || ''
+                });
+            } else if (msg.voice) {
+                await bot.sendVoice(GROUP_ID, msg.voice.file_id, messageOptions);
+            } else if (msg.sticker) {
+                await bot.sendSticker(GROUP_ID, msg.sticker.file_id, messageOptions);
+            } else if (msg.audio) {
+                await bot.sendAudio(GROUP_ID, msg.audio.file_id, {
+                    ...messageOptions,
+                    caption: msg.caption || ''
+                });
+            }
+            
+            // Подтверждение
+            await bot.sendMessage(chatId, '✅ Отправлено в тему', { 
+                reply_to_message_id: messageId 
+            });
+            
+            console.log('[FORWARD] Успешно переслано в тему');
+            
+        } catch (error) {
+            console.error('[FORWARD ERROR]', error);
+            
+            let errorMsg = '❌ Ошибка отправки';
+            if (error.message.includes('thread not found')) {
+                errorMsg = '❌ Тема не найдена. Используйте /setup для настройки';
+            }
+            
+            await bot.sendMessage(chatId, errorMsg);
         }
-        
-        await bot.sendMessage(chatId, errorMsg);
     }
 });
 
