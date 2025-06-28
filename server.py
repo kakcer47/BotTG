@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Set
 import aiohttp
 from aiohttp import web
-from telegram import Update, ChatMember
+from telegram import Update, ChatPermissions
 from telegram.ext import (
     Application, 
     CommandHandler, 
@@ -207,9 +207,15 @@ class TelegramLimitBot:
                     await context.bot.restrict_chat_member(
                         chat_id=chat_id,
                         user_id=user_id,
-                        permissions=ChatMember.RESTRICTED.mention_privileges_granted(
+                        permissions=ChatPermissions(
                             can_send_messages=False,
-                            can_send_media_messages=False,
+                            can_send_audios=False,
+                            can_send_documents=False,
+                            can_send_photos=False,
+                            can_send_videos=False,
+                            can_send_video_notes=False,
+                            can_send_voice_notes=False,
+                            can_send_polls=False,
                             can_send_other_messages=False,
                             can_add_web_page_previews=False
                         )
@@ -303,41 +309,6 @@ class TelegramLimitBot:
                 )
             except:
                 pass
-    
-    async def start_bot(self):
-        """Запускает бота"""
-        # Создаем приложение
-        self.application = Application.builder().token(self.token).build()
-        
-        # Добавляем обработчики
-        self.application.add_handler(CommandHandler("start", self.start_command))
-        self.application.add_handler(CommandHandler("status", self.status_command))
-        self.application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message)
-        )
-        self.application.add_handler(
-            MessageHandler(filters.PHOTO | filters.VIDEO | filters.DOCUMENT, self.handle_message)
-        )
-        
-        # Обработчик ошибок
-        self.application.add_error_handler(self.error_handler)
-        
-        # Запускаем keep-alive в фоне
-        self.keep_alive_task = asyncio.create_task(self.keep_alive())
-        
-        # Запускаем бота
-        logger.info("🚀 Запуск бота...")
-        await self.application.initialize()
-        await self.application.start()
-        await self.application.updater.start_polling(
-            drop_pending_updates=True,
-            allowed_updates=['message', 'edited_message', 'channel_post', 'edited_channel_post']
-        )
-        
-        logger.info("✅ Бот успешно запущен!")
-        
-        # Ждем завершения
-        await self.application.updater.idle()
 
 # Функция для веб-сервера (keep-alive endpoint)
 async def create_web_server():
@@ -377,11 +348,40 @@ async def main():
     
     # Запускаем бота
     try:
-        await bot.start_bot()
+        # Создаем приложение
+        bot.application = Application.builder().token(TOKEN).build()
+        
+        # Добавляем обработчики
+        bot.application.add_handler(CommandHandler("start", bot.start_command))
+        bot.application.add_handler(CommandHandler("status", bot.status_command))
+        bot.application.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message)
+        )
+        bot.application.add_handler(
+            MessageHandler(filters.PHOTO | filters.VIDEO | filters.DOCUMENT, bot.handle_message)
+        )
+        
+        # Обработчик ошибок
+        bot.application.add_error_handler(bot.error_handler)
+        
+        # Запускаем keep-alive в фоне
+        bot.keep_alive_task = asyncio.create_task(bot.keep_alive())
+        
+        logger.info("🚀 Запуск бота...")
+        logger.info("✅ Бот успешно запущен!")
+        
+        # Запускаем бота (блокирующий вызов)
+        await bot.application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=['message', 'edited_message', 'channel_post', 'edited_channel_post']
+        )
+        
     except KeyboardInterrupt:
         logger.info("🛑 Остановка бота...")
     except Exception as e:
         logger.error(f"💥 Критическая ошибка: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
     finally:
         if bot.keep_alive_task:
             bot.keep_alive_task.cancel()
