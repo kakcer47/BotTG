@@ -24,12 +24,13 @@ logger = logging.getLogger(__name__)
 # Conversation states
 CATEGORY, GENDER, LOCATION, DATE, ANNOUNCEMENT = range(5)
 
-# Environment variable for bot token (set in Render)
+# Environment variables
 import os
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:10000")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # Add your chat ID here
 
-# Function to ping the bot itself to prevent Render from idling
+# Function to ping the bot to prevent Render from idling
 def ping_self():
     try:
         response = requests.get(RENDER_URL)
@@ -53,19 +54,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Initiate the conversation, ask for category selection."""
     chat_id = update.effective_chat.id
     try:
-        # Fetch chat topics (threads) from the chat
-        forum_topics = await context.bot.get_forum_topic_icon_suggestions(chat_id)
-        topics = []
-        # Simulate topic fetching (replace with actual topic retrieval logic if needed)
-        # For simplicity, assuming topics are predefined or fetched dynamically
-        topic_names = ["General", "Philosophy", "Meetups", "Discussions"]  # Example topics
-        for i, topic in enumerate(topic_names):
-            topics.append(
-                InlineKeyboardButton(topic, callback_data=f"category_{topic}_{i}")
-            )
+        # Fetch forum topics from the chat
+        # Note: getForumTopics is not directly available in python-telegram-bot v20.7
+        # We'll simulate topics or use a predefined list for now
+        # Replace with actual API call when available or use Telegram Bot API directly
+        topics = [
+            {"name": "General", "thread_id": "1"},
+            {"name": "Philosophy", "thread_id": "2"},
+            {"name": "Meetups", "thread_id": "3"},
+            {"name": "Discussions", "thread_id": "4"},
+        ]  # Replace with actual topic fetching if possible
 
-        topics.append(InlineKeyboardButton("Back", callback_data="back_start"))
-        keyboard = [topics[i:i+2] for i in range(0, len(topics), 2)]  # 2 buttons per row
+        keyboard = [
+            [InlineKeyboardButton(topic["name"], callback_data=f"category_{topic['name']}_{topic['thread_id']}")]
+            for topic in topics
+        ]
+        keyboard.append([InlineKeyboardButton("Back", callback_data="back_start")])
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await update.message.reply_text(
@@ -119,7 +123,7 @@ async def gender_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Store selected gender
     context.user_data["gender"] = "Male" if data == "gender_male" else "Female"
 
-    keyboard = [[InlineKeyboardButton("Back", callback_data="back_gender")]]
+    keyboard = [[InlineKeyboardButton("Back Ascending"Back", callback_data="back_gender")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await query.message.delete()
@@ -133,7 +137,7 @@ async def location_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle location input, ask for date."""
     if update.message.text == "Back":
         await update.message.delete()
-        return await category_selected(update, context)
+        return await gender_selected(update, context)
 
     # Store location
     context.user_data["location"] = update.message.text
@@ -177,7 +181,7 @@ async def date_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if date_text == "Back":
             await update.message.delete()
             return await gender_selected(update, context)
-        # Allow any format for simplicity, or add regex for stricter validation
+        # Allow any format for simplicity
         context.user_data["date"] = date_text
 
         keyboard = [[InlineKeyboardButton("Back", callback_data="back_date")]]
@@ -213,16 +217,15 @@ async def announcement_received(update: Update, context: ContextTypes.DEFAULT_TY
     formatted_message = f">{header}\n{announcement}"
 
     # Post to the selected topic in the chat
-    chat_id = update.effective_chat.id
     try:
         message = await context.bot.send_message(
-            chat_id=chat_id,
+            chat_id=CHAT_ID,
             text=formatted_message,
             message_thread_id=int(category_id) if category_id.isdigit() else None
         )
 
-        # Generate a link to the message (Telegram doesn't provide direct links easily, so approximate)
-        message_link = f"https://t.me/c/{str(chat_id).replace('-100', '')}/{message.message_id}"
+        # Generate a link to the message
+        message_link = f"https://t.me/c/{str(CHAT_ID).replace('-100', '')}/{message.message_id}"
 
         # Notify user of successful posting
         await update.message.reply_text(
@@ -253,7 +256,7 @@ def main():
     """Run the bot."""
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Conversation handler
+    # Conversation handler with per_message=True to address warning
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -267,6 +270,7 @@ def main():
             ANNOUNCEMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, announcement_received)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=True  # Address the PTBUserWarning
     )
 
     # Add handlers
