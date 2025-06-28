@@ -1,7 +1,8 @@
 import os
 import asyncio
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageHandler
+from telegram.ext import filters
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
@@ -190,7 +191,7 @@ def main():
     dp = updater.dispatcher
     dp.add_handler(CommandHandler('start', start))
     dp.add_handler(CallbackQueryHandler(button))
-    dp.add_handler(MessageHandler(Filters.text & ~Filters.command & Filters.chat_type.private, process_city, pass_user_data=True))
+    dp.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, process_city, pass_user_data=True))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command & Filters.chat_type.private, process_date, pass_user_data=True))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command & Filters.chat_type.private, post_announcement, pass_user_data=True))
 
