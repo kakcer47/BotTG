@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 GROUP_ID = os.getenv('GROUP_ID')  # ID группы где публиковать
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')  # URL для webhook
-PORT = int(os.getenv('PORT', 8443))
+PORT = int(os.getenv('PORT', 10000))  # Render использует порт 10000 по умолчанию
 
 class MemoryDatabase:
     def __init__(self):
@@ -45,8 +45,10 @@ class MemoryDatabase:
                 'ads_count': 0,
                 'created_at': datetime.now()
             }
+            logger.info(f"Created new user: {user_id}")
         else:
             self.users[user_id]['language'] = language
+            logger.info(f"Updated user language: {user_id} -> {language}")
     
     def get_user_ads(self, user_id):
         """Получить объявления пользователя"""
@@ -81,6 +83,8 @@ class MemoryDatabase:
         # Увеличить счетчик объявлений пользователя
         if user_id in self.users:
             self.users[user_id]['ads_count'] += 1
+        
+        logger.info(f"Added ad {ad_id} for user {user_id}")
     
     def delete_ad(self, ad_id, user_id):
         """Удалить объявление"""
@@ -89,6 +93,7 @@ class MemoryDatabase:
             # Уменьшить счетчик объявлений пользователя
             if user_id in self.users and self.users[user_id]['ads_count'] > 0:
                 self.users[user_id]['ads_count'] -= 1
+            logger.info(f"Deleted ad {ad_id} for user {user_id}")
             return True
         return False
     
@@ -97,6 +102,7 @@ class MemoryDatabase:
         for ad_id, ad_data in self.ads.items():
             if ad_data['message_id'] == message_id:
                 ad_data['complaints'] += 1
+                logger.info(f"Added complaint to ad {ad_id}, total: {ad_data['complaints']}")
                 return (ad_data['complaints'], ad_data['user_id'], ad_data['topic_name'])
         return None
     
@@ -109,6 +115,7 @@ class MemoryDatabase:
                 # Уменьшить счетчик объявлений пользователя
                 if user_id in self.users and self.users[user_id]['ads_count'] > 0:
                     self.users[user_id]['ads_count'] -= 1
+                logger.info(f"Deleted ad {ad_id} by message_id {message_id}")
                 return user_id
         return None
 
@@ -178,6 +185,7 @@ class TelegramBot:
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда /start"""
         user_id = update.effective_user.id
+        logger.info(f"User {user_id} sent /start command")
         
         # Создаем пользователя если не существует
         self.db.create_or_update_user(user_id)
@@ -193,12 +201,15 @@ class TelegramBot:
             self.get_text(user_id, 'language'),
             reply_markup=reply_markup
         )
+        logger.info(f"Sent language selection to user {user_id}")
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка нажатий кнопок"""
         query = update.callback_query
         user_id = query.from_user.id
         data = query.data
+        
+        logger.info(f"User {user_id} pressed button: {data}")
         
         await query.answer()
         
@@ -251,8 +262,8 @@ class TelegramBot:
                         if ad[0] == ad_id:
                             await context.bot.delete_message(GROUP_ID, ad[1])
                             break
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"Error deleting message from group: {e}")
                 
                 # Показать обновленный список или категории
                 remaining_ads = self.db.get_user_ads(user_id)
@@ -276,8 +287,8 @@ class TelegramBot:
                             user_id_owner,
                             f"Ваше объявление в теме {result[2]} было удалено из-за нарушений"
                         )
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"Error processing complaint: {e}")
     
     async def show_categories(self, query, user_id):
         """Показать категории (темы)"""
@@ -320,6 +331,8 @@ class TelegramBot:
         user_id = update.effective_user.id
         text = update.message.text
         
+        logger.info(f"User {user_id} sent message: {text[:50]}...")
+        
         if user_id in self.user_states and 'topic_id' in self.user_states[user_id]:
             # Это объявление
             topic_id = self.user_states[user_id]['topic_id']
@@ -328,35 +341,27 @@ class TelegramBot:
             topics = await self.get_group_topics()
             topic_name = next((t['name'] for t in topics if t['id'] == topic_id), 'Общение')
             
-            # Создать кнопки для объявления
-            keyboard = [
-                [
-                    InlineKeyboardButton(
-                        self.get_text(user_id, 'complaint'),
-                        callback_data=f"complaint_{0}"  # message_id будет заменен после публикации
-                    ),
-                    InlineKeyboardButton(
-                        self.get_text(user_id, 'write'),
-                        url=f"tg://user?id={user_id}"
-                    )
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
             try:
-                # Публикация в группу
+                # Сначала публикуем без кнопок
                 message = await context.bot.send_message(
                     GROUP_ID,
                     text,
-                    reply_markup=reply_markup,
                     message_thread_id=topic_id if topic_id > 1 else None
                 )
                 
-                # Обновить кнопку жалобы с правильным message_id
-                keyboard[0][0] = InlineKeyboardButton(
-                    self.get_text(user_id, 'complaint'),
-                    callback_data=f"complaint_{message.message_id}"
-                )
+                # Теперь добавляем кнопки с правильным message_id
+                keyboard = [
+                    [
+                        InlineKeyboardButton(
+                            self.get_text(user_id, 'complaint'),
+                            callback_data=f"complaint_{message.message_id}"
+                        ),
+                        InlineKeyboardButton(
+                            self.get_text(user_id, 'write'),
+                            url=f"tg://user?id={user_id}"
+                        )
+                    ]
+                ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
                 await context.bot.edit_message_reply_markup(
@@ -369,6 +374,7 @@ class TelegramBot:
                 self.db.add_ad(user_id, message.message_id, topic_id, topic_name)
                 
                 await update.message.reply_text(self.get_text(user_id, 'ad_published'))
+                logger.info(f"Published ad for user {user_id} in topic {topic_name}")
                 
             except Exception as e:
                 logger.error(f"Error publishing ad: {e}")
@@ -378,6 +384,24 @@ class TelegramBot:
             if user_id in self.user_states:
                 del self.user_states[user_id]
     
+    async def webhook_handler(self, request):
+        """Обработчик webhook запросов"""
+        try:
+            # Получаем JSON из запроса
+            json_data = await request.json()
+            logger.info(f"Received webhook: {json_data}")
+            
+            # Создаем Update объект
+            update = Update.de_json(json_data, self.app.bot)
+            
+            # Обрабатываем update
+            await self.app.process_update(update)
+            
+            return {"status": "ok"}
+        except Exception as e:
+            logger.error(f"Webhook error: {e}")
+            return {"status": "error", "message": str(e)}
+    
     async def self_ping_loop(self):
         """Бесконечный цикл самопинга для предотвращения засыпания"""
         while True:
@@ -386,7 +410,7 @@ class TelegramBot:
                 
                 def ping_sync():
                     try:
-                        with urllib.request.urlopen(f"{WEBHOOK_URL}/", timeout=10) as response:
+                        with urllib.request.urlopen(f"{WEBHOOK_URL}/health", timeout=10) as response:
                             return response.status
                     except Exception:
                         return None
@@ -410,33 +434,39 @@ class TelegramBot:
         self.app.add_handler(CallbackQueryHandler(self.button_callback))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         
-        logger.info("🔄 Self-ping будет запущен через asyncio")
+        logger.info("Handlers configured successfully")
     
     async def run_webhook(self):
         """Запуск с webhook для Render"""
-        await self.app.initialize()
-        await self.app.start()
-        
-        # Установка webhook
-        webhook_url = f"{WEBHOOK_URL}/webhook"
-        await self.app.bot.set_webhook(webhook_url)
-        logger.info(f"🌐 Webhook set to: {webhook_url}")
-        
-        # Запуск самопинга в отдельной задаче
-        if WEBHOOK_URL:
-            asyncio.create_task(self.self_ping_loop())
-            logger.info("🔄 Self-ping task started")
-        
-        # Запуск webhook сервера
-        await self.app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=webhook_url,
-            drop_pending_updates=True
-        )
+        try:
+            await self.app.initialize()
+            await self.app.start()
+            
+            # Установка webhook
+            webhook_url = f"{WEBHOOK_URL}/webhook"
+            await self.app.bot.set_webhook(webhook_url)
+            logger.info(f"🌐 Webhook set to: {webhook_url}")
+            
+            # Запуск самопинга в отдельной задаче
+            if WEBHOOK_URL:
+                asyncio.create_task(self.self_ping_loop())
+                logger.info("🔄 Self-ping task started")
+            
+            # Запуск webhook сервера на правильном порту
+            await self.app.run_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path="/webhook",
+                webhook_url=webhook_url,
+                drop_pending_updates=True
+            )
+        except Exception as e:
+            logger.error(f"Webhook startup error: {e}")
+            raise
     
     async def run_polling(self):
         """Запуск с polling для разработки"""
+        logger.info("Starting polling mode...")
         await self.app.run_polling(drop_pending_updates=True)
 
 async def main():
@@ -444,9 +474,27 @@ async def main():
         logger.error("❌ BOT_TOKEN не задан!")
         return
     
+    if not GROUP_ID:
+        logger.error("❌ GROUP_ID не задан!")
+        return
+    
     logger.info("🚀 Запуск Telegram бота...")
+    logger.info(f"BOT_TOKEN: {'*' * 20}{BOT_TOKEN[-10:] if BOT_TOKEN else 'None'}")
+    logger.info(f"GROUP_ID: {GROUP_ID}")
+    logger.info(f"WEBHOOK_URL: {WEBHOOK_URL}")
+    logger.info(f"PORT: {PORT}")
+    
     bot = TelegramBot()
     bot.setup_handlers()
+    
+    # Проверим что бот работает
+    try:
+        async with bot.app:
+            bot_info = await bot.app.bot.get_me()
+            logger.info(f"✅ Bot connected: @{bot_info.username}")
+    except Exception as e:
+        logger.error(f"❌ Bot connection failed: {e}")
+        return
     
     if WEBHOOK_URL:
         logger.info("🌐 Режим: Webhook (для продакшена)")
