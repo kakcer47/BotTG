@@ -15,6 +15,7 @@ const app = express();
 const userSettings = new Map();
 const messageComplaints = new Map(); // messageId -> Set(userIds)
 const groupSettings = new Map(); // chatId -> { authorLinksEnabled: true/false }
+const messageCache = new Map(); // messageId -> { author, content, timestamp }
 
 // Список доступных тем (замените на реальные ID из вашей группы)
 const TOPICS = {
@@ -92,15 +93,15 @@ bot.onText(/\/setup (.+)/, async (msg, match) => {
     }
 });
 
-// Команда для включения/выключения автоссылок на авторов
-bot.onText(/\/author_links (on|off)/, async (msg, match) => {
+// Команда для включения/выключения панели управления
+bot.onText(/\/buttons (on|off)/, async (msg, match) => {
     if (msg.chat.id.toString() !== GROUP_ID) return;
     
     // Проверяем права администратора
     try {
         const member = await bot.getChatMember(msg.chat.id, msg.from.id);
         if (!['creator', 'administrator'].includes(member.status)) {
-            await bot.sendMessage(msg.chat.id, 'Только администраторы могут управлять автоссылками', {
+            await bot.sendMessage(msg.chat.id, 'Только администраторы могут управлять панелью', {
                 reply_to_message_id: msg.message_id
             });
             return;
@@ -112,10 +113,10 @@ bot.onText(/\/author_links (on|off)/, async (msg, match) => {
     
     const action = match[1];
     const settings = groupSettings.get(msg.chat.id) || {};
-    settings.authorLinksEnabled = (action === 'on');
+    settings.buttonsEnabled = (action === 'on');
     groupSettings.set(msg.chat.id, settings);
     
-    await bot.sendMessage(msg.chat.id, `Автоссылки на авторов ${action === 'on' ? 'включены' : 'выключены'}`, {
+    await bot.sendMessage(msg.chat.id, `Панель управления ${action === 'on' ? 'включена' : 'выключена'}`, {
         reply_to_message_id: msg.message_id
     });
     
@@ -125,124 +126,55 @@ bot.onText(/\/author_links (on|off)/, async (msg, match) => {
     } catch (error) {}
 });
 
-// Команды модерации (в ответ на сообщения)
-bot.onText(/\/complain/, async (msg) => {
-    if (msg.chat.id.toString() !== GROUP_ID || !msg.reply_to_message) return;
-    
-    const originalMessageId = msg.reply_to_message.message_id;
-    const userId = msg.from.id;
-    
-    if (!messageComplaints.has(originalMessageId)) {
-        messageComplaints.set(originalMessageId, new Set());
-    }
-    
-    const complaints = messageComplaints.get(originalMessageId);
-    
-    if (complaints.has(userId)) {
-        await bot.sendMessage(GROUP_ID, 'Вы уже жаловались на это сообщение', {
-            reply_to_message_id: msg.message_id
-        });
-        return;
-    }
-    
-    complaints.add(userId);
-    
-    if (complaints.size >= 5) {
-        try {
-            await bot.deleteMessage(GROUP_ID, originalMessageId);
-            await bot.sendMessage(GROUP_ID, `Сообщение удалено по жалобам (${complaints.size} жалоб)`, {
-                reply_to_message_id: msg.message_id
-            });
-            messageComplaints.delete(originalMessageId);
-        } catch (error) {
-            await bot.sendMessage(GROUP_ID, 'Не удалось удалить сообщение', {
-                reply_to_message_id: msg.message_id
-            });
-        }
-    } else {
-        await bot.sendMessage(GROUP_ID, `Жалоба принята (${complaints.size}/5)`, {
-            reply_to_message_id: msg.message_id
-        });
-    }
-    
-    // Удаляем команду жалобы
-    try {
-        await bot.deleteMessage(GROUP_ID, msg.message_id);
-    } catch (error) {}
-});
-
-bot.onText(/\/share/, async (msg) => {
-    if (msg.chat.id.toString() !== GROUP_ID || !msg.reply_to_message) return;
-    
-    const originalMessageId = msg.reply_to_message.message_id;
-    const groupIdNum = GROUP_ID.replace('-100', '');
-    const messageLink = `https://t.me/c/${groupIdNum}/${originalMessageId}`;
-    
-    try {
-        await bot.sendMessage(msg.from.id, `Ссылка на сообщение:\n${messageLink}`);
-        await bot.sendMessage(GROUP_ID, 'Ссылка отправлена в личные сообщения', {
-            reply_to_message_id: msg.message_id
-        });
-    } catch (error) {
-        await bot.sendMessage(GROUP_ID, 'Сначала напишите боту в личку: @' + (await bot.getMe()).username, {
-            reply_to_message_id: msg.message_id
-        });
-    }
-    
-    // Удаляем команду
-    try {
-        await bot.deleteMessage(GROUP_ID, msg.message_id);
-    } catch (error) {}
-});
-
-bot.onText(/\/author/, async (msg) => {
-    if (msg.chat.id.toString() !== GROUP_ID || !msg.reply_to_message) return;
-    
-    const authorId = msg.reply_to_message.from.id;
-    const authorName = msg.reply_to_message.from.first_name;
-    
-    try {
-        await bot.sendMessage(msg.from.id, `Написать автору: @${authorName}\ntg://user?id=${authorId}`);
-        await bot.sendMessage(GROUP_ID, 'Ссылка на автора отправлена в личные сообщения', {
-            reply_to_message_id: msg.message_id
-        });
-    } catch (error) {
-        await bot.sendMessage(GROUP_ID, 'Сначала напишите боту в личку: @' + (await bot.getMe()).username, {
-            reply_to_message_id: msg.message_id
-        });
-    }
-    
-    // Удаляем команду
-    try {
-        await bot.deleteMessage(GROUP_ID, msg.message_id);
-    } catch (error) {}
-});
-
-// Помощь по командам модерации
-bot.onText(/\/help_moderation/, async (msg) => {
+// Команда для проверки статуса панели
+bot.onText(/\/buttons_status/, async (msg) => {
     if (msg.chat.id.toString() !== GROUP_ID) return;
     
-    const helpText = `🔧 Команды модерации (в ответ на сообщения):
+    const settings = groupSettings.get(msg.chat.id) || { buttonsEnabled: true };
+    const status = settings.buttonsEnabled ? 'включена ✅' : 'выключена ❌';
+    
+    await bot.sendMessage(GROUP_ID, `Панель управления: ${status}`, {
+        reply_to_message_id: msg.message_id
+    });
+    
+    // Удаляем команду через 3 секунды
+    setTimeout(async () => {
+        try {
+            await bot.deleteMessage(msg.chat.id, msg.message_id);
+        } catch (error) {}
+    }, 3000);
+});
 
-/complain - Пожаловаться (при 5 жалобах сообщение удаляется)
-/share - Получить ссылку на сообщение
-/author - Связаться с автором сообщения
+// Помощь по функциям бота
+bot.onText(/\/help_buttons/, async (msg) => {
+    if (msg.chat.id.toString() !== GROUP_ID) return;
+    
+    const helpText = `🔧 Панель управления сообщениями:
 
-🔗 Управление автоссылками (только админы):
-/author_links on - Включить автоссылки под сообщениями
-/author_links off - Выключить автоссылки
+Под каждым сообщением автоматически появляются кнопки:
+• Пожаловаться - при 5 жалобах сообщение удаляется
+• Удалить для себя - скрывает панель управления
+• Переслать - отправляет ссылку на сообщение в личку
+• Написать автору - отправляет контакт автора в личку
 
-Используйте команды модерации в ответ на нужное сообщение.`;
+🔗 Управление панелью (только админы):
+/buttons on - Включить панель управления
+/buttons off - Выключить панель управления
+/buttons_status - Проверить статус панели
+
+Все ссылки отправляются в личные сообщения с ботом.`;
     
     await bot.sendMessage(GROUP_ID, helpText, {
         reply_to_message_id: msg.message_id
     });
 });
 
-// Обработка выбора темы
+// Обработка выбора темы и кнопок модерации
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const data = query.data;
+    const userId = query.from.id;
+    const messageId = query.message.message_id;
     
     if (data.startsWith('topic_')) {
         const topicId = data.replace('topic_', '');
@@ -252,42 +184,160 @@ bot.on('callback_query', async (query) => {
         
         await bot.editMessageText(`Тема: ${topicName}\nТеперь ваши сообщения будут отправляться в эту тему.`, {
             chat_id: chatId,
-            message_id: query.message.message_id
+            message_id: messageId
         });
         
         await bot.answerCallbackQuery(query.id);
     }
+    
+    // Обработка кнопок модерации
+    else if (data.startsWith('complain_')) {
+        const originalMessageId = data.replace('complain_', '');
+        
+        if (!messageComplaints.has(originalMessageId)) {
+            messageComplaints.set(originalMessageId, new Set());
+        }
+        
+        const complaints = messageComplaints.get(originalMessageId);
+        
+        if (complaints.has(userId)) {
+            await bot.answerCallbackQuery(query.id, { text: 'Вы уже пожаловались на это сообщение' });
+            return;
+        }
+        
+        complaints.add(userId);
+        
+        if (complaints.size >= 5) {
+            try {
+                await bot.deleteMessage(GROUP_ID, originalMessageId);
+                await bot.editMessageText('Сообщение удалено по жалобам', {
+                    chat_id: chatId,
+                    message_id: messageId
+                });
+                messageComplaints.delete(originalMessageId);
+                messageCache.delete(originalMessageId);
+            } catch (error) {
+                await bot.answerCallbackQuery(query.id, { text: 'Не удалось удалить сообщение' });
+            }
+        } else {
+            await bot.answerCallbackQuery(query.id, { text: `Жалоба принята (${complaints.size}/5)` });
+            
+            // Обновляем кнопки с новым счетчиком
+            const keyboard = {
+                inline_keyboard: [[
+                    { text: `Пожаловаться (${complaints.size}/5)`, callback_data: `complain_${originalMessageId}` },
+                    { text: 'Удалить для себя', callback_data: `delete_${originalMessageId}` }
+                ], [
+                    { text: 'Переслать', callback_data: `forward_${originalMessageId}` },
+                    { text: 'Написать автору', callback_data: `write_${originalMessageId}` }
+                ]]
+            };
+            
+            try {
+                await bot.editMessageReplyMarkup(keyboard, {
+                    chat_id: chatId,
+                    message_id: messageId
+                });
+            } catch (error) {}
+        }
+    }
+    
+    else if (data.startsWith('delete_')) {
+        try {
+            await bot.deleteMessage(chatId, messageId);
+            await bot.answerCallbackQuery(query.id, { text: 'Панель управления скрыта' });
+        } catch (error) {
+            await bot.answerCallbackQuery(query.id, { text: 'Не удалось скрыть панель' });
+        }
+    }
+    
+    else if (data.startsWith('forward_')) {
+        const originalMessageId = data.replace('forward_', '');
+        const groupIdNum = GROUP_ID.replace('-100', '');
+        const messageLink = `https://t.me/c/${groupIdNum}/${originalMessageId}`;
+        
+        try {
+            await bot.sendMessage(userId, `Ссылка на сообщение:\n${messageLink}`);
+            await bot.answerCallbackQuery(query.id, { text: 'Ссылка отправлена в личные сообщения' });
+        } catch (error) {
+            await bot.answerCallbackQuery(query.id, { text: 'Сначала напишите боту в личку' });
+        }
+    }
+    
+    else if (data.startsWith('write_')) {
+        const originalMessageId = data.replace('write_', '');
+        const cachedMessage = messageCache.get(originalMessageId);
+        
+        if (!cachedMessage) {
+            await bot.answerCallbackQuery(query.id, { text: 'Информация об авторе не найдена' });
+            return;
+        }
+        
+        const author = cachedMessage.author;
+        let authorLink = '';
+        
+        if (author.username) {
+            authorLink = `@${author.username}\nhttps://t.me/${author.username}`;
+        } else {
+            authorLink = `${author.first_name}\ntg://user?id=${author.id}`;
+        }
+        
+        try {
+            await bot.sendMessage(userId, `Написать автору:\n${authorLink}`);
+            await bot.answerCallbackQuery(query.id, { text: 'Ссылка на автора отправлена в личку' });
+        } catch (error) {
+            await bot.answerCallbackQuery(query.id, { text: 'Сначала напишите боту в личку' });
+        }
+    }
 });
 
-// Пересылка сообщений и автоссылки на авторов
+// Пересылка сообщений и панель управления
 bot.on('message', async (msg) => {
-    // Автоссылки на авторов в группе
+    // Панель управления для сообщений в группе
     if (msg.chat.id.toString() === GROUP_ID && !msg.from.is_bot && !msg.text?.startsWith('/')) {
-        const settings = groupSettings.get(msg.chat.id) || { authorLinksEnabled: true };
+        const settings = groupSettings.get(msg.chat.id) || { buttonsEnabled: true };
         
-        if (settings.authorLinksEnabled) {
+        if (settings.buttonsEnabled) {
             try {
-                let authorLink = '';
-                let authorName = msg.from.first_name || 'Пользователь';
+                // Сохраняем сообщение в кеш
+                messageCache.set(msg.message_id, {
+                    author: {
+                        id: msg.from.id,
+                        username: msg.from.username,
+                        first_name: msg.from.first_name,
+                        last_name: msg.from.last_name
+                    },
+                    content: msg.text || 'Медиа',
+                    timestamp: Date.now()
+                });
                 
-                // Пытаемся использовать username
+                // Создаем панель управления
+                const keyboard = {
+                    inline_keyboard: [[
+                        { text: 'Пожаловаться', callback_data: `complain_${msg.message_id}` },
+                        { text: 'Удалить для себя', callback_data: `delete_${msg.message_id}` }
+                    ], [
+                        { text: 'Переслать', callback_data: `forward_${msg.message_id}` },
+                        { text: 'Написать автору', callback_data: `write_${msg.message_id}` }
+                    ]]
+                };
+                
+                // Определяем имя автора для отображения
+                let authorName = msg.from.first_name || 'Пользователь';
+                if (msg.from.last_name) {
+                    authorName += ` ${msg.from.last_name}`;
+                }
                 if (msg.from.username) {
-                    authorLink = `@${msg.from.username}`;
-                } else {
-                    // Если username нет, используем Telegram ID
-                    authorLink = `[${authorName}](tg://user?id=${msg.from.id})`;
+                    authorName += ` (@${msg.from.username})`;
                 }
                 
-                // Добавляем информацию об авторе
-                const authorInfo = `👤 Автор: ${authorLink}`;
-                
-                await bot.sendMessage(GROUP_ID, authorInfo, {
+                await bot.sendMessage(GROUP_ID, `Управление сообщением от ${authorName}:`, {
                     reply_to_message_id: msg.message_id,
-                    parse_mode: 'Markdown',
-                    disable_notification: true // Тихая отправка
+                    reply_markup: keyboard,
+                    disable_notification: true
                 });
             } catch (error) {
-                console.error('Ошибка добавления ссылки на автора:', error);
+                console.error('Ошибка создания панели управления:', error);
             }
         }
         return;
@@ -351,6 +401,21 @@ bot.on('message', async (msg) => {
         await bot.sendMessage(chatId, errorMsg);
     }
 });
+
+// Очистка кеша каждые 30 минут (удаляем сообщения старше 1 часа)
+setInterval(() => {
+    const now = Date.now();
+    const oneHour = 60 * 60 * 1000;
+    
+    for (const [messageId, data] of messageCache.entries()) {
+        if (now - data.timestamp > oneHour) {
+            messageCache.delete(messageId);
+            messageComplaints.delete(messageId);
+        }
+    }
+    
+    console.log(`Кеш очищен. Сообщений в кеше: ${messageCache.size}`);
+}, 30 * 60 * 1000);
 
 // Обработка ошибок
 bot.on('error', (error) => {
