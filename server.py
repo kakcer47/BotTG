@@ -378,27 +378,31 @@ class TelegramBot:
             if user_id in self.user_states:
                 del self.user_states[user_id]
     
-    async def self_ping(self, context: ContextTypes.DEFAULT_TYPE):
-        """Самопинг для предотвращения засыпания"""
-        try:
-            def ping_sync():
-                try:
-                    with urllib.request.urlopen(f"{WEBHOOK_URL}/", timeout=10) as response:
-                        return response.status
-                except Exception:
-                    return None
-            
-            # Выполняем синхронный запрос в отдельном потоке
-            import concurrent.futures
-            loop = asyncio.get_event_loop()
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                status = await loop.run_in_executor(executor, ping_sync)
-                if status:
-                    logger.info(f"🔄 Self-ping successful: {status}")
-                else:
-                    logger.info("🔄 Self-ping executed (no status)")
-        except Exception as e:
-            logger.error(f"Self-ping error: {e}")
+    async def self_ping_loop(self):
+        """Бесконечный цикл самопинга для предотвращения засыпания"""
+        while True:
+            try:
+                await asyncio.sleep(1500)  # 25 минут
+                
+                def ping_sync():
+                    try:
+                        with urllib.request.urlopen(f"{WEBHOOK_URL}/", timeout=10) as response:
+                            return response.status
+                    except Exception:
+                        return None
+                
+                # Выполняем синхронный запрос в отдельном потоке
+                import concurrent.futures
+                loop = asyncio.get_event_loop()
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    status = await loop.run_in_executor(executor, ping_sync)
+                    if status:
+                        logger.info(f"🔄 Self-ping successful: {status}")
+                    else:
+                        logger.info("🔄 Self-ping executed (no status)")
+            except Exception as e:
+                logger.error(f"Self-ping error: {e}")
+                await asyncio.sleep(60)  # При ошибке ждем минуту и пробуем снова
     
     def setup_handlers(self):
         """Настройка обработчиков"""
@@ -406,13 +410,7 @@ class TelegramBot:
         self.app.add_handler(CallbackQueryHandler(self.button_callback))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         
-        # Самопинг каждые 25 минут (1500 секунд)
-        job_queue = self.app.job_queue
-        if job_queue:
-            job_queue.run_repeating(self.self_ping, interval=1500, first=10)
-            logger.info("🔄 Self-ping scheduled every 25 minutes")
-        else:
-            logger.warning("⚠️ JobQueue not available - self-ping disabled")
+        logger.info("🔄 Self-ping будет запущен через asyncio")
     
     async def run_webhook(self):
         """Запуск с webhook для Render"""
@@ -423,6 +421,11 @@ class TelegramBot:
         webhook_url = f"{WEBHOOK_URL}/webhook"
         await self.app.bot.set_webhook(webhook_url)
         logger.info(f"🌐 Webhook set to: {webhook_url}")
+        
+        # Запуск самопинга в отдельной задаче
+        if WEBHOOK_URL:
+            asyncio.create_task(self.self_ping_loop())
+            logger.info("🔄 Self-ping task started")
         
         # Запуск webhook сервера
         await self.app.run_webhook(
