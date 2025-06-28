@@ -36,7 +36,8 @@ class Announcement(Base):
     message_id = Column(Integer)
     complaint_count = Column(Integer, default=0)
 
-Base.metadata.create_all(engine)
+Base.metadata.drop_all(engine)  # УДАЛЯЕТ все таблицы
+Base.metadata.create_all(engine)  # СОЗДАЕТ заново
 
 # Самопинг для поддержания активности
 async def keep_alive():
