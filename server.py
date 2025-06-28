@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-import psycopg2
+import psycopg
 import aiohttp
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -30,12 +30,11 @@ class Database:
         self.init_db()
     
     def get_connection(self):
-        return psycopg2.connect(self.database_url)
+        return psycopg.connect(self.database_url)
     
     def init_db(self):
         """Инициализация базы данных"""
-        conn = self.get_connection()
-        try:
+        with psycopg.connect(self.database_url) as conn:
             with conn.cursor() as cur:
                 # Таблица пользователей с лимитами
                 cur.execute("""
@@ -66,23 +65,17 @@ class Database:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_ads_message_id ON ads(message_id)")
                 
             conn.commit()
-        finally:
-            conn.close()
     
     def get_user(self, user_id):
         """Получить данные пользователя"""
-        conn = self.get_connection()
-        try:
+        with psycopg.connect(self.database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
                 return cur.fetchone()
-        finally:
-            conn.close()
     
     def create_or_update_user(self, user_id, language='ru'):
         """Создать или обновить пользователя"""
-        conn = self.get_connection()
-        try:
+        with psycopg.connect(self.database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO users (user_id, language) 
@@ -91,26 +84,20 @@ class Database:
                     DO UPDATE SET language = EXCLUDED.language
                 """, (user_id, language))
             conn.commit()
-        finally:
-            conn.close()
     
     def get_user_ads(self, user_id):
         """Получить объявления пользователя"""
-        conn = self.get_connection()
-        try:
+        with psycopg.connect(self.database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT id, message_id, topic_id, topic_name, created_at 
                     FROM ads WHERE user_id = %s ORDER BY created_at DESC
                 """, (user_id,))
                 return cur.fetchall()
-        finally:
-            conn.close()
     
     def add_ad(self, user_id, message_id, topic_id, topic_name):
         """Добавить объявление"""
-        conn = self.get_connection()
-        try:
+        with psycopg.connect(self.database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO ads (user_id, message_id, topic_id, topic_name) 
@@ -122,29 +109,24 @@ class Database:
                     WHERE user_id = %s
                 """, (user_id,))
             conn.commit()
-        finally:
-            conn.close()
     
     def delete_ad(self, ad_id, user_id):
         """Удалить объявление"""
-        conn = self.get_connection()
-        try:
+        with psycopg.connect(self.database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM ads WHERE id = %s AND user_id = %s", (ad_id, user_id))
-                if cur.rowcount > 0:
+                deleted = cur.rowcount > 0
+                if deleted:
                     cur.execute("""
                         UPDATE users SET ads_count = ads_count - 1 
                         WHERE user_id = %s AND ads_count > 0
                     """, (user_id,))
             conn.commit()
-            return cur.rowcount > 0
-        finally:
-            conn.close()
+            return deleted
     
     def add_complaint(self, message_id):
         """Добавить жалобу к объявлению"""
-        conn = self.get_connection()
-        try:
+        with psycopg.connect(self.database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE ads SET complaints = complaints + 1 
@@ -153,13 +135,10 @@ class Database:
                 result = cur.fetchone()
             conn.commit()
             return result
-        finally:
-            conn.close()
     
     def delete_ad_by_message_id(self, message_id):
         """Удалить объявление по message_id"""
-        conn = self.get_connection()
-        try:
+        with psycopg.connect(self.database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT user_id FROM ads WHERE message_id = %s", (message_id,))
                 user_data = cur.fetchone()
@@ -171,8 +150,6 @@ class Database:
                     """, (user_data[0],))
             conn.commit()
             return user_data[0] if user_data else None
-        finally:
-            conn.close()
 
 class TelegramBot:
     def __init__(self):
