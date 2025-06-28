@@ -14,6 +14,7 @@ const app = express();
 // Хранилище пользовательских настроек и жалоб
 const userSettings = new Map();
 const messageComplaints = new Map(); // messageId -> Set(userIds)
+const groupSettings = new Map(); // chatId -> { authorLinksEnabled: true/false }
 
 // Список доступных тем (замените на реальные ID из вашей группы)
 const TOPICS = {
@@ -89,6 +90,39 @@ bot.onText(/\/setup (.+)/, async (msg, match) => {
     } catch (error) {
         await bot.sendMessage(chatId, 'Ошибка настройки тем');
     }
+});
+
+// Команда для включения/выключения автоссылок на авторов
+bot.onText(/\/author_links (on|off)/, async (msg, match) => {
+    if (msg.chat.id.toString() !== GROUP_ID) return;
+    
+    // Проверяем права администратора
+    try {
+        const member = await bot.getChatMember(msg.chat.id, msg.from.id);
+        if (!['creator', 'administrator'].includes(member.status)) {
+            await bot.sendMessage(msg.chat.id, 'Только администраторы могут управлять автоссылками', {
+                reply_to_message_id: msg.message_id
+            });
+            return;
+        }
+    } catch (error) {
+        console.error('Ошибка проверки прав:', error);
+        return;
+    }
+    
+    const action = match[1];
+    const settings = groupSettings.get(msg.chat.id) || {};
+    settings.authorLinksEnabled = (action === 'on');
+    groupSettings.set(msg.chat.id, settings);
+    
+    await bot.sendMessage(msg.chat.id, `Автоссылки на авторов ${action === 'on' ? 'включены' : 'выключены'}`, {
+        reply_to_message_id: msg.message_id
+    });
+    
+    // Удаляем команду
+    try {
+        await bot.deleteMessage(msg.chat.id, msg.message_id);
+    } catch (error) {}
 });
 
 // Команды модерации (в ответ на сообщения)
@@ -194,7 +228,11 @@ bot.onText(/\/help_moderation/, async (msg) => {
 /share - Получить ссылку на сообщение
 /author - Связаться с автором сообщения
 
-Используйте эти команды в ответ на нужное сообщение.`;
+🔗 Управление автоссылками (только админы):
+/author_links on - Включить автоссылки под сообщениями
+/author_links off - Выключить автоссылки
+
+Используйте команды модерации в ответ на нужное сообщение.`;
     
     await bot.sendMessage(GROUP_ID, helpText, {
         reply_to_message_id: msg.message_id
@@ -221,9 +259,41 @@ bot.on('callback_query', async (query) => {
     }
 });
 
-// Пересылка сообщений
+// Пересылка сообщений и автоссылки на авторов
 bot.on('message', async (msg) => {
-    // Игнорировать команды и сообщения из целевой группы
+    // Автоссылки на авторов в группе
+    if (msg.chat.id.toString() === GROUP_ID && !msg.from.is_bot && !msg.text?.startsWith('/')) {
+        const settings = groupSettings.get(msg.chat.id) || { authorLinksEnabled: true };
+        
+        if (settings.authorLinksEnabled) {
+            try {
+                let authorLink = '';
+                let authorName = msg.from.first_name || 'Пользователь';
+                
+                // Пытаемся использовать username
+                if (msg.from.username) {
+                    authorLink = `@${msg.from.username}`;
+                } else {
+                    // Если username нет, используем Telegram ID
+                    authorLink = `[${authorName}](tg://user?id=${msg.from.id})`;
+                }
+                
+                // Добавляем информацию об авторе
+                const authorInfo = `👤 Автор: ${authorLink}`;
+                
+                await bot.sendMessage(GROUP_ID, authorInfo, {
+                    reply_to_message_id: msg.message_id,
+                    parse_mode: 'Markdown',
+                    disable_notification: true // Тихая отправка
+                });
+            } catch (error) {
+                console.error('Ошибка добавления ссылки на автора:', error);
+            }
+        }
+        return;
+    }
+    
+    // Игнорировать команды и сообщения из целевой группы для пересылки
     if (msg.text?.startsWith('/') || msg.chat.id.toString() === GROUP_ID) return;
     
     const chatId = msg.chat.id;
