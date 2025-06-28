@@ -5,7 +5,7 @@ from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, MessageH
 from telegram.ext import filters
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base
 import time
 
 # Инициализация бота и базы данных
@@ -36,7 +36,7 @@ class Announcement(Base):
     message_id = Column(Integer)
     complaint_count = Column(Integer, default=0)
 
-Base.metadata.drop_all(engine)  # УДАЛЯЕТ все таблицы
+Base.metadata.drop_all(engine, cascade=True)  # УДАЛЯЕТ все таблицы
 Base.metadata.create_all(engine)  # СОЗДАЕТ заново
 
 # Самопинг для поддержания активности
