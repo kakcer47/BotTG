@@ -3,7 +3,7 @@
 server.py - Telegram Web App Server
 Объединенный сервер для WebSocket, HTTP и Telegram Bot
 Автор: Assistant 
-Версия: 1.0
+Версия: 1.1
 """
 
 import asyncio
@@ -109,6 +109,7 @@ class DatabaseService:
                     favorites BIGINT[] DEFAULT '{}',
                     hidden BIGINT[] DEFAULT '{}',
                     liked BIGINT[] DEFAULT '{}',
+                    reported_posts BIGINT[] DEFAULT '{}',
                     posts BIGINT[] DEFAULT '{}',
                     is_banned BOOLEAN DEFAULT FALSE,
                     ban_reason TEXT,
@@ -155,8 +156,15 @@ class DatabaseService:
                 """, user_data['user_id'], user_data['username'], user_data['first_name'],
                     user_data['last_name'], user_data['photo_url'])
             
+            # Получаем актуальное количество опубликованных постов
+            published_count = await conn.fetchval("""
+                SELECT COUNT(*) FROM posts 
+                WHERE user_id = $1 AND status = 'approved'
+            """, user_data['user_id'])
+            
             # Кешируем пользователя
             user_dict = dict(user)
+            user_dict['published_posts'] = published_count
             user_cache[user_data['user_id']] = user_dict
             return user_dict
 
@@ -182,20 +190,28 @@ class DatabaseService:
             return post_dict
 
     @staticmethod
-    async def get_posts(filters: Dict, page: int, limit: int, search: str = '') -> List[Dict]:
+    async def get_posts(filters: Dict, page: int, limit: int, search: str = '', user_id: int = None) -> List[Dict]:
         async with get_db_connection() as conn:
             query = """
-                SELECT * FROM posts
-                WHERE status = 'approved'
-                AND category = $1
+                SELECT p.*, 
+                       (CASE WHEN $10::BIGINT = ANY(u.liked) THEN TRUE ELSE FALSE END) as user_liked
+                FROM posts p
+                LEFT JOIN users u ON u.user_id = $10
+                WHERE p.status = 'approved'
             """
             params = [filters.get('category', '')]
             param_count = 1
             
+            # Категория
+            if filters.get('category'):
+                param_count += 1
+                query += f" AND p.category = ${param_count}"
+                params.append(filters['category'])
+            
             # Поиск
             if search:
                 param_count += 1
-                query += f" AND LOWER(description) LIKE LOWER($${param_count})"
+                query += f" AND LOWER(p.description) LIKE LOWER(${param_count})"
                 params.append(f"%{search}%")
             
             # Фильтры по тегам
@@ -204,21 +220,38 @@ class DatabaseService:
                     if values and filter_type != 'sort' and isinstance(values, list):
                         for value in values:
                             param_count += 1
-                            query += f" AND tags @> $${param_count}"
+                            query += f" AND p.tags @> ${param_count}"
                             params.append(json.dumps([f"{filter_type}:{value}"]))
+            
+            # Специальные фильтры
+            if filters.get('filters', {}).get('sort'):
+                sort_type = filters['filters']['sort']
+                if sort_type == 'my' and user_id:
+                    query += f" AND p.user_id = ${len(params) + 1}"
+                    params.append(user_id)
+                elif sort_type == 'favorites' and user_id:
+                    query += f" AND p.id = ANY((SELECT favorites FROM users WHERE user_id = ${len(params) + 1}))"
+                    params.append(user_id)
+                elif sort_type == 'hidden' and user_id:
+                    query += f" AND p.id = ANY((SELECT hidden FROM users WHERE user_id = ${len(params) + 1}))"
+                    params.append(user_id)
             
             # Сортировка
             sort_type = filters.get('filters', {}).get('sort', 'new')
             if sort_type == 'old':
-                query += " ORDER BY created_at ASC"
+                query += " ORDER BY p.created_at ASC"
             elif sort_type == 'rating':
-                query += " ORDER BY likes DESC, created_at DESC"
+                query += " ORDER BY p.likes DESC, p.created_at DESC"
             else:
-                query += " ORDER BY created_at DESC"
+                query += " ORDER BY p.created_at DESC"
+            
+            # Добавляем недостающие параметры до $10
+            while len(params) < 10:
+                params.append(None)
             
             query += f" LIMIT {limit} OFFSET {(page - 1) * limit}"
             
-            posts = await conn.fetch(query, *params)
+            posts = await conn.fetch(query, *params[:9], user_id)
             result = [dict(post) for post in posts]
             
             # Кешируем полученные посты
@@ -262,23 +295,62 @@ class DatabaseService:
             return result.split()[-1] == '1'
 
     @staticmethod
-    async def like_post(post_id: int) -> Optional[Dict]:
+    async def like_post(post_id: int, user_id: int) -> Optional[Dict]:
         async with get_db_connection() as conn:
-            await conn.execute("UPDATE posts SET likes = likes + 1 WHERE id = $1 AND status = 'approved'", post_id)
+            # Проверяем, лайкал ли пользователь этот пост
+            user = await conn.fetchrow("SELECT liked FROM users WHERE user_id = $1", user_id)
+            if not user:
+                return None
+            
+            liked_posts = user['liked'] or []
+            
+            if post_id in liked_posts:
+                # Убираем лайк
+                await conn.execute("""
+                    UPDATE users SET liked = array_remove(liked, $1) WHERE user_id = $2
+                """, post_id, user_id)
+                await conn.execute("""
+                    UPDATE posts SET likes = likes - 1 WHERE id = $1 AND status = 'approved'
+                """, post_id)
+                action = 'removed'
+            else:
+                # Ставим лайк
+                await conn.execute("""
+                    UPDATE users SET liked = array_append(liked, $1) WHERE user_id = $2
+                """, post_id, user_id)
+                await conn.execute("""
+                    UPDATE posts SET likes = likes + 1 WHERE id = $1 AND status = 'approved'
+                """, post_id)
+                action = 'added'
+            
             post = await conn.fetchrow("SELECT * FROM posts WHERE id = $1", post_id)
             if post:
                 post_dict = dict(post)
+                post_dict['like_action'] = action
+                post_dict['user_liked'] = action == 'added'
                 posts_cache[post_id] = post_dict
                 return post_dict
             return None
 
     @staticmethod
-    async def report_post(post_id: int, reporter_id: int, reason: str = None) -> bool:
+    async def report_post(post_id: int, reporter_id: int, reason: str = None) -> Dict:
         async with get_db_connection() as conn:
+            # Проверяем, жаловался ли пользователь на этот пост
+            user = await conn.fetchrow("SELECT reported_posts FROM users WHERE user_id = $1", reporter_id)
+            if user and user['reported_posts'] and post_id in user['reported_posts']:
+                return {'success': False, 'message': 'already_reported'}
+            
+            # Добавляем жалобу
             await conn.execute("""
                 INSERT INTO post_reports (post_id, reporter_id, reason) VALUES ($1, $2, $3)
             """, post_id, reporter_id, reason)
-            return True
+            
+            # Добавляем пост в список пожалованных пользователем
+            await conn.execute("""
+                UPDATE users SET reported_posts = array_append(reported_posts, $1) WHERE user_id = $2
+            """, post_id, reporter_id)
+            
+            return {'success': True, 'message': 'reported'}
 
     @staticmethod
     async def get_post_by_id(post_id: int) -> Optional[Dict]:
@@ -293,6 +365,50 @@ class DatabaseService:
                 posts_cache[post_id] = post_dict
                 return post_dict
             return None
+
+    @staticmethod
+    async def add_to_favorites(post_id: int, user_id: int) -> Dict:
+        async with get_db_connection() as conn:
+            user = await conn.fetchrow("SELECT favorites FROM users WHERE user_id = $1", user_id)
+            if not user:
+                return {'success': False, 'message': 'user_not_found'}
+            
+            favorites = user['favorites'] or []
+            
+            if post_id in favorites:
+                # Убираем из избранного
+                await conn.execute("""
+                    UPDATE users SET favorites = array_remove(favorites, $1) WHERE user_id = $2
+                """, post_id, user_id)
+                return {'success': True, 'action': 'removed', 'message': 'removed_from_favorites'}
+            else:
+                # Добавляем в избранное
+                await conn.execute("""
+                    UPDATE users SET favorites = array_append(favorites, $1) WHERE user_id = $2
+                """, post_id, user_id)
+                return {'success': True, 'action': 'added', 'message': 'added_to_favorites'}
+
+    @staticmethod
+    async def hide_post(post_id: int, user_id: int) -> Dict:
+        async with get_db_connection() as conn:
+            user = await conn.fetchrow("SELECT hidden FROM users WHERE user_id = $1", user_id)
+            if not user:
+                return {'success': False, 'message': 'user_not_found'}
+            
+            hidden = user['hidden'] or []
+            
+            if post_id in hidden:
+                # Показываем пост
+                await conn.execute("""
+                    UPDATE users SET hidden = array_remove(hidden, $1) WHERE user_id = $2
+                """, post_id, user_id)
+                return {'success': True, 'action': 'shown', 'message': 'post_shown'}
+            else:
+                # Скрываем пост
+                await conn.execute("""
+                    UPDATE users SET hidden = array_append(hidden, $1) WHERE user_id = $2
+                """, post_id, user_id)
+                return {'success': True, 'action': 'hidden', 'message': 'post_hidden'}
 
     @staticmethod
     async def is_user_banned(user_id: int) -> bool:
@@ -323,6 +439,15 @@ class DatabaseService:
         async with get_db_connection() as conn:
             result = await conn.fetchval("SELECT post_limit FROM users WHERE user_id = $1", user_id)
             return result or config.DAILY_POST_LIMIT
+
+    @staticmethod
+    async def get_user_published_posts_count(user_id: int) -> int:
+        async with get_db_connection() as conn:
+            result = await conn.fetchval("""
+                SELECT COUNT(*) FROM posts 
+                WHERE user_id = $1 AND status = 'approved'
+            """, user_id)
+            return result or 0
 
 # Система лимитов (в памяти)
 class PostLimitService:
@@ -475,14 +600,56 @@ class ModerationBot:
             logger.error(f"Failed to send moderation message: {e}")
             return await DatabaseService.approve_post(post['id'])
 
+    async def send_report_for_moderation(self, post: Dict, reporter_data: Dict, reason: str = None):
+        if not config.MODERATION_CHAT_ID:
+            logger.warning("MODERATION_CHAT_ID not set, cannot send report")
+            return
+        
+        try:
+            creator = json.loads(post['creator']) if isinstance(post['creator'], str) else post['creator']
+            
+            text = (
+                f"🚨 ЖАЛОБА НА ОБЪЯВЛЕНИЕ #{post['id']}\n\n"
+                f"👤 Автор объявления: {creator['first_name']} {creator.get('last_name', '')}\n"
+                f"🆔 ID автора: {creator['user_id']}\n"
+                f"👤 Username автора: @{creator.get('username', 'нет')}\n\n"
+                f"🚨 Жалобу подал: {reporter_data['first_name']} {reporter_data.get('last_name', '')}\n"
+                f"🆔 ID жалобщика: {reporter_data['user_id']}\n"
+                f"👤 Username жалобщика: @{reporter_data.get('username', 'нет')}\n\n"
+                f"📂 Категория: {post['category']}\n"
+                f"📄 Текст объявления:\n{post['description']}\n\n"
+                f"🏷 Теги: {', '.join(json.loads(post['tags']) if post['tags'] else [])}\n\n"
+                f"💬 Причина жалобы: {reason or 'Не указана'}"
+            )
+            
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🗑 Удалить объявление", callback_data=f"delete_{post['id']}"),
+                    InlineKeyboardButton("✅ Оставить", callback_data=f"keep_{post['id']}")
+                ]
+            ])
+            
+            await telegram_bot.send_message(
+                chat_id=config.MODERATION_CHAT_ID,
+                text=text,
+                reply_markup=keyboard
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to send report message: {e}")
+
 # WebSocket
-async def broadcast_message(message: Dict):
+async def broadcast_message(message: Dict, filter_data: Dict = None):
     if connected_clients:
         message_str = json.dumps(message)
         disconnected_clients = set()
         
         for client in connected_clients.copy():
             try:
+                # Если это обновление поста, не отправляем broadcast
+                # Пользователи сами обновят при смене фильтров
+                if message.get('type') == 'post_updated' and filter_data:
+                    continue
                 await client.send(message_str)
             except websockets.exceptions.ConnectionClosed:
                 disconnected_clients.add(client)
@@ -526,13 +693,15 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
     
     if action == 'sync_user':
         user_data = await DatabaseService.sync_user(data)
+        published_count = await DatabaseService.get_user_published_posts_count(user_id)
         await websocket.send(json.dumps({
-            'type': 'user_data',
+            'type': 'user_synced',
             'user_id': user_data['user_id'],
-            'first_name': user_data['first_name'],
-            'last_name': user_data['last_name'],
-            'username': user_data['username'],
-            'photo_url': user_data['photo_url']
+            'limits': {
+                'used': published_count,
+                'total': user_data.get('post_limit', config.DAILY_POST_LIMIT)
+            },
+            'is_banned': user_data.get('is_banned', False)
         }))
     
     elif action == 'create_post':
@@ -550,7 +719,7 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
             'description': data['description'],
             'category': data['category'],
             'tags': data['tags'],
-            'creator': data['creator']
+            'creator': data['creator_data']
         })
         
         # Отправляем на модерацию
@@ -558,14 +727,22 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
             moderation_bot = ModerationBot()
             await moderation_bot.send_for_moderation(post)
         
+        # Получаем обновленное количество опубликованных постов
+        published_count = await DatabaseService.get_user_published_posts_count(user_id)
+        limit = await DatabaseService.get_user_limit(user_id)
+        
         await websocket.send(json.dumps({
             'type': 'post_created',
-            'message': 'Объявление отправлено на модерацию'
+            'message': 'Объявление отправлено на модерацию',
+            'limits': {
+                'used': published_count,
+                'total': limit
+            }
         }))
     
     elif action == 'get_posts':
         posts = await DatabaseService.get_posts(
-            data, data['page'], data['limit'], data.get('search', '')
+            data, data['page'], data['limit'], data.get('search', ''), user_id
         )
         await websocket.send(json.dumps({
             'type': 'posts',
@@ -574,21 +751,74 @@ async def handle_websocket_message(websocket: WebSocketServerProtocol, data: Dic
         }))
     
     elif action == 'like_post':
-        post = await DatabaseService.like_post(data['post_id'])
+        post = await DatabaseService.like_post(data['post_id'], user_id)
         if post:
-            await broadcast_message({'type': 'post_updated', 'post': post})
+            # Отправляем только этому пользователю обновление
+            await websocket.send(json.dumps({'type': 'post_updated', 'post': post}))
     
     elif action == 'delete_post':
-        success = await DatabaseService.delete_post(data['post_id'], data['user_id'])
+        success = await DatabaseService.delete_post(data['post_id'], user_id)
         if success:
+            # Получаем обновленное количество опубликованных постов
+            published_count = await DatabaseService.get_user_published_posts_count(user_id)
+            limit = await DatabaseService.get_user_limit(user_id)
+            
             await broadcast_message({'type': 'post_deleted', 'post_id': data['post_id']})
+            await websocket.send(json.dumps({
+                'type': 'limits_updated',
+                'limits': {
+                    'used': published_count,
+                    'total': limit
+                }
+            }))
     
     elif action == 'report_post':
-        await DatabaseService.report_post(
-            data['post_id'], 
-            data['user_id'], 
-            data.get('reason')
-        )
+        post = await DatabaseService.get_post_by_id(data['post_id'])
+        if post:
+            result = await DatabaseService.report_post(
+                data['post_id'], 
+                user_id, 
+                data.get('reason')
+            )
+            
+            if result['success']:
+                if result['message'] == 'already_reported':
+                    await websocket.send(json.dumps({
+                        'type': 'error',
+                        'message': 'Вы уже отправляли жалобу на это объявление'
+                    }))
+                else:
+                    # Отправляем жалобу модераторам
+                    if telegram_bot:
+                        moderation_bot = ModerationBot()
+                        reporter_data = {
+                            'user_id': user_id,
+                            'first_name': data.get('reporter_first_name', ''),
+                            'last_name': data.get('reporter_last_name', ''),
+                            'username': data.get('reporter_username', '')
+                        }
+                        await moderation_bot.send_report_for_moderation(post, reporter_data, data.get('reason'))
+                    
+                    await websocket.send(json.dumps({
+                        'type': 'report_sent',
+                        'message': 'Жалоба отправлена модераторам'
+                    }))
+    
+    elif action == 'add_to_favorites':
+        result = await DatabaseService.add_to_favorites(data['post_id'], user_id)
+        await websocket.send(json.dumps({
+            'type': 'favorites_updated',
+            'action': result['action'],
+            'message': result['message']
+        }))
+    
+    elif action == 'hide_post':
+        result = await DatabaseService.hide_post(data['post_id'], user_id)
+        await websocket.send(json.dumps({
+            'type': 'hide_updated',
+            'action': result['action'],
+            'message': result['message']
+        }))
 
 # Основная функция для запуска HTTP сервера статических файлов
 async def serve_static_files():
